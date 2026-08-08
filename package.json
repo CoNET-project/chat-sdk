@@ -1,0 +1,50 @@
+{
+  "name": "@conet-project/chat-sdk",
+  "version": "0.1.0",
+  "description": "Beamio CoNET Chat SDK — gossip messaging in a Web Worker (zero main-thread openpgp/verify) + encrypted fragmented IPFS history. UI-agnostic, reusable across SilentPassUI / bizSite / Alliance / POS.",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker/entry.d.ts",
+      "import": "./dist/worker/entry.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "ethers": "^6.0.0",
+    "openpgp": "^5.0.0 || ^6.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CoNET-project/chat-sdk.git"
+  },
+  "homepage": "https://github.com/CoNET-project/chat-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/CoNET-project/chat-sdk/issues"
+  },
+  "sideEffectsNote": "Worker entry (./worker) is a side-effectful module; import only inside a Worker context.",
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

@@ -1,0 +1,11 @@
+# dependencies
+node_modules/
+
+# build output (produced by `npm run build`)
+dist/
+
+# misc
+*.log
+.DS_Store
+.env
+.env.*

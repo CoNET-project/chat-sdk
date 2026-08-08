@@ -1,0 +1,119 @@
+/**
+ * Node selection + health helpers. Runtime-agnostic (Worker-safe: uses `fetch`,
+ * `self` timers). Ported from SilentPassUI `services/chat.ts` with window.* removed.
+ *
+ * Routing rule reminder: send business payloads to entry A ≠ mailbox B; listen via
+ * entry C ≠ B. Mailbox B is identified by matching the contact route armored key.
+ */
+
+import type { NodeInfo } from './types.js'
+
+export const getRandomNode = (allNodes: NodeInfo[]): NodeInfo | null => {
+	if (!allNodes.length) return null
+	return allNodes[Math.floor(Math.random() * allNodes.length)]
+}
+
+/** Random n distinct nodes (used for send fan-out / presence). */
+export const getRandomNodes = (allNodes: NodeInfo[], n: number): NodeInfo[] => {
+	if (!allNodes.length || n <= 0) return []
+	const shuffled = [...allNodes].sort(() => Math.random() - 0.5)
+	return shuffled.slice(0, Math.min(n, shuffled.length))
+}
+
+export const normalizeArmoredKey = (v?: string): string => (v || '').replace(/\r/g, '').trim()
+
+/** Mailbox B nodes = nodes whose armored public key equals the contact route key. */
+export const pickRouteNodesByArmoredKey = (
+	nodes: NodeInfo[],
+	routerArmoredPublicKey: string,
+): NodeInfo[] => {
+	const target = normalizeArmoredKey(routerArmoredPublicKey)
+	if (!target) return []
+	return nodes.filter((n) => normalizeArmoredKey(n.armoredPublicKey) === target)
+}
+
+const GOSSIP_HEALTH_TTL_MS = 120_000
+const gossipHealthyCache = new Map<string, number>()
+
+export const markGossipNodeHealthy = (domain: string): void => {
+	gossipHealthyCache.set(domain, Date.now() + GOSSIP_HEALTH_TTL_MS)
+}
+export const markGossipNodeBad = (domain: string): void => {
+	gossipHealthyCache.delete(domain)
+}
+const isGossipNodeHealthy = (domain: string): boolean => (gossipHealthyCache.get(domain) || 0) > Date.now()
+
+async function postWithTimeout(url: string, init: RequestInit, timeoutMs = 12_000): Promise<Response> {
+	const ctrl = new AbortController()
+	const t = setTimeout(() => ctrl.abort(), timeoutMs)
+	try {
+		return await fetch(url, { ...init, signal: ctrl.signal })
+	} finally {
+		clearTimeout(t)
+	}
+}
+
+export { postWithTimeout }
+
+const probeGossipNode = async (node: NodeInfo, timeoutMs = 4_000): Promise<boolean> => {
+	const origin = (self as unknown as { location?: { origin?: string } }).location?.origin || 'https://beamio.app'
+	const postUrl = `https://${node.domain}.conet.network/post`
+	try {
+		const res = await postWithTimeout(
+			postUrl,
+			{
+				method: 'OPTIONS',
+				headers: {
+					Origin: origin,
+					'Access-Control-Request-Method': 'POST',
+					'Access-Control-Request-Headers': 'content-type',
+				},
+			},
+			timeoutMs,
+		)
+		const acao = (res.headers.get('access-control-allow-origin') || '').trim()
+		if (res.status > 0 && res.status < 500 && (acao === '*' || acao.length > 0)) {
+			markGossipNodeHealthy(node.domain)
+			return true
+		}
+	} catch {
+		/* fall through to GET / */
+	}
+	try {
+		const res = await postWithTimeout(
+			`https://${node.domain}.conet.network/`,
+			{ method: 'GET', headers: { Accept: 'text/html' } },
+			timeoutMs,
+		)
+		if (res.status > 0 && res.status < 500) {
+			markGossipNodeHealthy(node.domain)
+			return true
+		}
+	} catch {
+		/* ignore */
+	}
+	markGossipNodeBad(node.domain)
+	return false
+}
+
+export const pickHealthyGossipNodes = async (nodes: NodeInfo[]): Promise<NodeInfo[]> => {
+	if (!nodes.length) return []
+	const cached = nodes.filter((n) => isGossipNodeHealthy(n.domain))
+	if (cached.length >= 2) return cached
+	const sample = getRandomNodes(nodes, Math.min(10, nodes.length))
+	const checks = await Promise.all(sample.map(async (node) => ({ node, ok: await probeGossipNode(node) })))
+	return checks.filter((n) => n.ok).map((n) => n.node)
+}
+
+/** Pick up to n entry nodes for gossip send (healthy preferred, exclude mailbox B). */
+export const pickGossipEntryNodesForSend = async (
+	pool: NodeInfo[],
+	n = 4,
+	excludeDomains?: Set<string>,
+): Promise<NodeInfo[]> => {
+	const filtered = excludeDomains?.size ? pool.filter((node) => !excludeDomains.has(node.domain)) : pool
+	if (!filtered.length) return []
+	const healthy = await pickHealthyGossipNodes(filtered)
+	const source = healthy.length >= 2 ? healthy : filtered
+	return getRandomNodes(source, Math.min(n, source.length))
+}
