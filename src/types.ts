@@ -181,7 +181,7 @@ export interface BeamioChatConfig {
 	/** Local persistence (IndexedDB adapter). Optional; history still works in-memory without it. */
 	persistence?: PersistenceAdapter
 	runtime?: ChatRuntimeOptions
-	/** Chain id used in history master derivation domain string. Default 8453 (Base). */
+	/** Chain id used in history master derivation domain string. Default 224422 (CoNET L1). */
 	chainId?: number
 }
 

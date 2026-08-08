@@ -113,7 +113,7 @@ class BeamioChatClientImpl implements BeamioChatClient {
 			addressPgpContractAddress: this.config.addressPgpContractAddress,
 			ipfsBaseUrl: this.config.ipfsBaseUrl,
 			ipfsWriteBaseUrl: this.config.ipfsWriteBaseUrl,
-			chainId: this.config.chainId ?? 8453,
+			chainId: this.config.chainId ?? 224422,
 			runtime: { ...DEFAULT_RUNTIME, ...(this.config.runtime ?? {}) },
 			nodes: this.nodes,
 			routes: this.routes,
