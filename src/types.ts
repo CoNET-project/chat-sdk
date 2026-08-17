@@ -6,12 +6,14 @@
  * local persistence) is injected through {@link BeamioChatConfig}.
  *
  * Routing rules (do not violate — see repo rules `conet-p2p-mailbox-routing-protocol`,
- * `beamio-conet-chat-protocol`):
+ * `beamio-conet-chat-protocol`, and `src/docs/gitbook/l0/si-developer-guide.md`):
  *  - Send business payloads encrypted to the recipient EOA *user* PGP, POSTed to an
  *    entry node A ≠ mailbox B.
  *  - Listen SSE is encrypted to mailbox B route key, connected via entry C ≠ B, and
  *    MUST carry `listenKind: 'chat'`.
  *  - Delivery ACK is encrypted to the mailbox B route key.
+ *  - Each POST wraps that inner armor to **that entry's** route public key (peel at
+ *    the entry). Clients never set `X-CoNET-Hop-Sigs`.
  */
 
 /** A CoNET Guardian / entry / mailbox node descriptor. Mirrors the app `nodeInfo`. */
@@ -52,7 +54,7 @@ export interface ChatRoute {
 	address: string
 	/** Recipient's user PGP public key — business payloads are encrypted to this. */
 	userPublicKeyArmored: string
-	/** Recipient mailbox B route armored public key — listen/ACK are encrypted to this. */
+	/** Recipient mailbox B route armored public key — listen/ACK/mailbox work are encrypted to this. */
 	routerArmoredPublicKey?: string
 	routePgpKeyID?: string
 }
@@ -161,6 +163,22 @@ export interface ChatRuntimeOptions {
 	reconnectBaseMs?: number
 	/** Max reconnect backoff ms. Default 30000. */
 	reconnectMaxMs?: number
+	/**
+	 * Encrypt already-built inner armor to each entry's route public key before
+	 * `POST /post` (SI peel). Default `true`. One-layer user-PGP still works if false.
+	 */
+	outerWrap?: boolean
+}
+
+/** Options for {@link BeamioChatClient.sendMessage}. */
+export interface SendMessageOptions {
+	sendId?: string
+	/**
+	 * Skip APNs / offline push. SDK wraps the user-PGP armor as mailbox work
+	 * `{ data, NoPush: true }` encrypted to the recipient mailbox route key.
+	 * HTTP `POST /post` stays `{ data }` only.
+	 */
+	beamioNoPush?: boolean
 }
 
 export interface BeamioChatConfig {
@@ -183,6 +201,18 @@ export interface BeamioChatConfig {
 	runtime?: ChatRuntimeOptions
 	/** Chain id used in history master derivation domain string. Default 224422 (CoNET L1). */
 	chainId?: number
+	/**
+	 * ChatIndexRegistry proxy (CoNET 224422) — on-chain head pointer to the encrypted
+	 * history index (IPFS content hash). Read via RPC `getPointer(eoa)`; write via the
+	 * gasless relay ({@link apiBaseUrl}/setChatIndexPointer). Default = canonical proxy.
+	 */
+	chatIndexRegistryAddress?: string
+	/**
+	 * Cluster API base for the gasless index-pointer relay, e.g. `https://beamio.app`.
+	 * When absent, history still persists to IPFS + local mirror, but the on-chain head
+	 * pointer is not updated (fresh-device recovery would be unavailable).
+	 */
+	apiBaseUrl?: string
 }
 
 /** History load options. */
@@ -197,9 +227,9 @@ export interface HistoryLoadOptions {
 
 export interface BeamioChatHistory {
 	/**
-	 * Restore encrypted history: locate index (via point-${L} / IndexedDB) → decrypt →
-	 * eagerly decrypt the tail → backfill older entries in the background. Emits
-	 * `historyBuffer` increments as they become available.
+	 * Restore encrypted history: read the on-chain head pointer (RPC `getPointer(eoa)`) or the
+	 * local IndexedDB mirror → fetch + decrypt the index → eagerly decrypt the tail → backfill
+	 * older entries in the background. Emits `historyBuffer` increments as they become available.
 	 */
 	load(options?: HistoryLoadOptions): Promise<void>
 	/** Append (persist) a new sent/received entry to encrypted history + local mirror. */
@@ -211,7 +241,12 @@ export interface BeamioChatHistory {
 export interface BeamioChatClient {
 	init(): Promise<void>
 	/** Encrypt & send a business payload to a contact via entry A ≠ mailbox B. */
-	sendMessage(to: ChatRoute, payload: string, opts?: { sendId?: string }): Promise<{ sendId: string }>
+	sendMessage(to: ChatRoute, payload: string, opts?: SendMessageOptions): Promise<{ sendId: string }>
+	/** Encrypt a mailbox command (e.g. gossip_delivery_ack) to route B and POST via entry C ≠ B. */
+	postMailboxCommand(
+		routerArmoredPublicKey: string,
+		command: Record<string, unknown>,
+	): Promise<boolean>
 	on<K extends ChatEventName>(event: K, cb: ChatEventListener<K>): Unsubscribe
 	/** Probe mailbox listen-pool presence for the given contacts. */
 	queryPresence(contacts: ChatRoute[]): Promise<Record<string, boolean>>

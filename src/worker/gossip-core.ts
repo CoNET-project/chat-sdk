@@ -10,9 +10,11 @@
  *  - `wallet_online_query` presence (encrypt to mailbox B route key, POST via C ≠ B)
  *
  * Routing rules preserved (repo `conet-p2p-mailbox-routing-protocol`,
- * `beamio-conet-chat-protocol`): listen encrypted to mailbox B route key via entry
- * C ≠ B with `listenKind:'chat'`; business payload encrypted to recipient EOA user
- * PGP via entry A ≠ B; ACK encrypted to mailbox B route key.
+ * `beamio-conet-chat-protocol`, `src/docs/gitbook/l0/si-developer-guide.md`):
+ * listen encrypted to mailbox B route key via entry C ≠ B with `listenKind:'chat'`;
+ * business payload encrypted to recipient EOA user PGP via entry A ≠ B; ACK
+ * encrypted to mailbox B route key. Each POST wraps inner armor to **that entry's**
+ * route public key. Clients never set `X-CoNET-Hop-Sigs`.
  */
 
 import {
@@ -38,9 +40,11 @@ import {
 	pickGossipEntryNodesForSend,
 	pickHealthyGossipNodes,
 	pickRouteNodesByArmoredKey,
+	postUrl,
 	postWithTimeout,
 } from '../nodes.js'
 import { base64ToUtf8, keccakUtf8, utf8ToBase64 } from '../crypto.js'
+import { buildPostBody, encryptRouteCommand, wrapArmorToEntryRoute, wrapArmorToMailboxWork } from '../envelope.js'
 
 /** Callbacks the worker entry wires to `postMessage`. */
 export interface GossipEmit {
@@ -93,6 +97,8 @@ export class GossipCore {
 	private listenController: AbortController | null = null
 	private lastActivityAt = 0
 	private paused = false
+	/** Listen `Securitykey` (aes-256-cbc). Sent on the command; live SI SSE frames are still plaintext JSON. */
+	private listenSecurityKey = ''
 	private ackContext: {
 		routerArmoredPublicKey: string
 		entryNodes: NodeInfo[]
@@ -135,6 +141,7 @@ export class GossipCore {
 
 	pause(): void {
 		this.paused = true
+		this.listenSecurityKey = ''
 		this.clearListen('background_pause')
 		this.lastActivityAt = 0
 		this.emit.status('paused')
@@ -193,25 +200,18 @@ export class GossipCore {
 
 		try {
 			const key = utf8ToBase64(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))))
-			const command = {
-				command: 'mining',
-				listenKind: 'chat',
-				walletAddress: this.wallet.address,
-				algorithm: 'aes-256-cbc',
-				Securitykey: key,
-			}
-			const message = JSON.stringify(command)
-			const signMessage = await this.wallet.signMessage(message)
-			const encryptionKeys = await readKey({ armoredKey: ownRouteKey })
-			const pgpMsg = await createMessage({
-				text: utf8ToBase64(JSON.stringify({ message, signMessage })),
-			})
-			const postData = await encrypt({
-				message: pgpMsg,
-				encryptionKeys,
-				config: { preferredCompressionAlgorithm: enums.compression.zlib },
-			})
-			const gossipBody = JSON.stringify({ data: postData })
+			this.listenSecurityKey = key
+			const innerArmor = await encryptRouteCommand(
+				this.wallet,
+				{
+					command: 'mining',
+					listenKind: 'chat',
+					walletAddress: this.wallet.address,
+					algorithm: 'aes-256-cbc',
+					Securitykey: key,
+				},
+				ownRouteKey,
+			)
 
 			const entryCandidates = this.nodes.filter((n) => !mailboxDomains.has(n.domain))
 			const healthyNodes = await pickHealthyGossipNodes(entryCandidates.length ? entryCandidates : this.nodes)
@@ -228,7 +228,7 @@ export class GossipCore {
 				mailboxDomains: [...mailboxDomains],
 			}
 
-			this.spawnGossip(healthyNodes, gossipBody, rootSignal)
+			this.spawnGossip(healthyNodes, innerArmor, rootSignal)
 			this.emit.status('listening')
 		} catch (ex) {
 			this.emit.log('error', `startListen error: ${(ex as Error)?.message ?? String(ex)}`)
@@ -240,7 +240,7 @@ export class GossipCore {
 
 	private spawnGossip(
 		nodes: NodeInfo[],
-		body: string,
+		innerArmor: string,
 		rootSignal: AbortSignal,
 		timeoutConfig?: Partial<TimeoutConfig>,
 		reconnectAttempt = 0,
@@ -255,7 +255,7 @@ export class GossipCore {
 			retryDelay: 2_000,
 			...timeoutConfig,
 		}
-		const url = `https://${node.domain}.conet.network/post`
+		const url = postUrl(node.domain)
 		const controller = new AbortController()
 		const onRootAbort = () => controller.abort('root_stop')
 		rootSignal.addEventListener('abort', onRootAbort)
@@ -276,7 +276,7 @@ export class GossipCore {
 			setTimeout(() => {
 				if (rootSignal.aborted) return
 				this.emit.log('info', `reconnecting entry C attempt=${nextAttempt} reason=${reason || 'stream_end'}`)
-				this.spawnGossip(nodes, body, rootSignal, timeoutConfig, nextAttempt)
+				this.spawnGossip(nodes, innerArmor, rootSignal, timeoutConfig, nextAttempt)
 			}, delay)
 		}
 
@@ -291,6 +291,10 @@ export class GossipCore {
 			let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
 			let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null = null
 			try {
+				const armored =
+					this.cfg?.runtime.outerWrap === false
+						? innerArmor
+						: await wrapArmorToEntryRoute(innerArmor, node.armoredPublicKey)
 				const res = await fetch(url, {
 					method: 'POST',
 					headers: {
@@ -298,7 +302,7 @@ export class GossipCore {
 						Accept: 'text/event-stream',
 						Connection: 'keep-alive',
 					},
-					body,
+					body: JSON.stringify(buildPostBody(armored)),
 					signal: controller.signal,
 					cache: 'no-store',
 				})
@@ -446,8 +450,8 @@ export class GossipCore {
 		}
 	}
 
-	// ---- Send (recipient EOA user PGP, entry A ≠ B) ----------------------------
-	async send(to: ChatRoute, text: string): Promise<boolean> {
+	// ---- Send (recipient EOA user PGP, entry A ≠ B, wrap to each A) ------------
+	async send(to: ChatRoute, text: string, opts?: { beamioNoPush?: boolean }): Promise<boolean> {
 		if (!this.wallet) throw new Error('not initialised')
 		const pgpPublic = to.userPublicKeyArmored?.trim()
 		if (!pgpPublic) {
@@ -456,37 +460,59 @@ export class GossipCore {
 		}
 		const signMessage = await this.wallet.signMessage(text)
 		const message = { timestamp: Date.now(), text, from: this.wallet.address, signMessage }
-		let postData: string
+		let innerArmor: string
 		try {
 			const encObj = {
 				message: await createMessage({ text: utf8ToBase64(JSON.stringify(message)) }),
 				encryptionKeys: await readKey({ armoredKey: pgpPublic }),
 				config: { preferredCompressionAlgorithm: enums.compression.zlib },
 			}
-			postData = await encrypt(encObj)
+			innerArmor = await encrypt(encObj)
 		} catch (ex: unknown) {
 			this.emit.log('error', `send encrypt error: ${(ex as Error)?.message ?? String(ex)}`)
 			return false
 		}
-		const body = JSON.stringify({ data: postData })
+		if (opts?.beamioNoPush) {
+			const mailboxKey = to.routerArmoredPublicKey?.trim()
+			if (!mailboxKey) {
+				this.emit.log('error', 'send: NoPush requires recipient mailbox routerArmoredPublicKey')
+				return false
+			}
+			try {
+				innerArmor = await wrapArmorToMailboxWork(innerArmor, mailboxKey, { NoPush: true })
+			} catch (ex: unknown) {
+				this.emit.log('error', `send mailbox wrap error: ${(ex as Error)?.message ?? String(ex)}`)
+				return false
+			}
+		}
 		const mailboxDomains = new Set(pickRouteNodesByArmoredKey(this.nodes, to.routerArmoredPublicKey || '').map((n) => n.domain))
-		return this.postToEntries(body, mailboxDomains)
+		return this.postToEntries(innerArmor, mailboxDomains)
 	}
 
-	private async postToEntries(body: string, excludeDomains: Set<string>): Promise<boolean> {
-		const postOpts: RequestInit = {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body,
-			referrerPolicy: 'no-referrer',
-		}
+	private async postToEntries(
+		innerArmor: string,
+		excludeDomains: Set<string>,
+	): Promise<boolean> {
 		const send = async (targets: NodeInfo[]): Promise<boolean> => {
 			if (!targets.length) return false
 			const results = await Promise.all(
 				targets.map(async (node) => {
-					const url = `https://${node.domain}.conet.network/post`
+					const url = postUrl(node.domain)
 					try {
-						const res = await postWithTimeout(url, postOpts, 12_000)
+						const armored =
+							this.cfg?.runtime.outerWrap === false
+								? innerArmor
+								: await wrapArmorToEntryRoute(innerArmor, node.armoredPublicKey)
+						const res = await postWithTimeout(
+							url,
+							{
+								method: 'POST',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify(buildPostBody(armored)),
+								referrerPolicy: 'no-referrer',
+							},
+							12_000,
+						)
 						if (!res.ok) {
 							markGossipNodeBad(node.domain)
 							return false
@@ -542,27 +568,26 @@ export class GossipCore {
 				targetWallet: ethers.getAddress(targetWallet),
 				timestamp,
 			}
-			const message = JSON.stringify(command)
-			const signMessage = await this.wallet.signMessage(message)
-			const encryptionKeys = await readKey({ armoredKey: routerArmoredPublicKey })
-			const pgpMsg = await createMessage({ text: utf8ToBase64(JSON.stringify({ message, signMessage })) })
-			const postData = await encrypt({
-				message: pgpMsg,
-				encryptionKeys,
-				config: { preferredCompressionAlgorithm: enums.compression.zlib },
-			})
-			const armored = typeof postData === 'string' ? postData : String((postData as { data?: string })?.data ?? postData)
-			const payload = JSON.stringify({ data: armored })
+			const innerArmor = await encryptRouteCommand(this.wallet, command, routerArmoredPublicKey)
 			const pool = this.nodes.filter((n) => n?.domain && !mailboxDomains.has(n.domain))
 			const entries = await pickGossipEntryNodesForSend(pool.length ? pool : this.nodes, 4, mailboxDomains)
 			const targets = entries.length ? entries : getRandomNodes(pool.length ? pool : this.nodes, 4)
 			const results = await Promise.all(
 				targets.map(async (node) => {
-					const url = `https://${node.domain}.conet.network/post`
+					const url = postUrl(node.domain)
 					try {
+						const armored =
+							this.cfg?.runtime.outerWrap === false
+								? innerArmor
+								: await wrapArmorToEntryRoute(innerArmor, node.armoredPublicKey)
 						const res = await postWithTimeout(
 							url,
-							{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload, referrerPolicy: 'no-referrer' },
+							{
+								method: 'POST',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify(buildPostBody(armored)),
+								referrerPolicy: 'no-referrer',
+							},
 							10_000,
 						)
 						const text = (await res.text()).trim()
@@ -590,23 +615,17 @@ export class GossipCore {
 	}
 
 	/** Encrypt a mailbox command (e.g. gossip_delivery_ack) to route B and POST via entry C ≠ B. */
-	async postMailboxCommand(routerArmoredPublicKey: string, command: Record<string, unknown>): Promise<boolean> {
+	async postMailboxCommand(
+		routerArmoredPublicKey: string,
+		command: Record<string, unknown>,
+	): Promise<boolean> {
 		if (!this.wallet) return false
 		try {
-			const message = JSON.stringify(command)
-			const signMessage = await this.wallet.signMessage(message)
-			const encryptionKeys = await readKey({ armoredKey: routerArmoredPublicKey })
-			const pgpMsg = await createMessage({ text: utf8ToBase64(JSON.stringify({ message, signMessage })) })
-			const postData = await encrypt({
-				message: pgpMsg,
-				encryptionKeys,
-				config: { preferredCompressionAlgorithm: enums.compression.zlib },
-			})
-			const armored = typeof postData === 'string' ? postData : String((postData as { data?: string })?.data ?? postData)
+			const innerArmor = await encryptRouteCommand(this.wallet, command, routerArmoredPublicKey)
 			const mailboxDomains = new Set(
 				pickRouteNodesByArmoredKey(this.nodes, routerArmoredPublicKey).map((n) => n.domain),
 			)
-			return this.postToEntries(JSON.stringify({ data: armored }), mailboxDomains)
+			return this.postToEntries(innerArmor, mailboxDomains)
 		} catch (ex) {
 			this.emit.log('warn', `postMailboxCommand error: ${(ex as Error)?.message ?? String(ex)}`)
 			return false

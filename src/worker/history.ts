@@ -1,13 +1,17 @@
 /**
  * Encrypted fragmented IPFS history — runs inside the Worker.
  *
- * Design (repo plan `beamio_chat_sdk`):
- *  - master  = keccak256(EOA_sign("beamio.chat.history.v1|chainId|eoa"))  (private key never leaves worker)
- *  - locator L = HKDF(master, "index-locator")  → hidden in the hash-sea; re-pointed via server `point-${L}`
- *  - indexKey  = HKDF(master, "index-enc")       → AES-256-GCM of the ordered index manifest
+ * Design (repo plan `beamio_chat_sdk`, on-chain head pointer variant):
+ *  - master   = keccak256(EOA_sign("beamio.chat.history.v1|chainId|eoa"))  (private key never leaves worker)
+ *  - indexKey = HKDF(master, "index-enc")       → AES-256-GCM of the ordered index manifest
  *  - fragment ratchet: k_i = HKDF(master, `frag|${seq}|${cid_{i-1}}`), cid_{-1}=HKDF(master,"frag-genesis")
- *      cipher_i = AES-GCM(k_i, plaintext_i); cid_i = keccak256(cipher_i) → uploaded fragment address.
+ *      cipher_i = AES-GCM(k_i, plaintext_i); cid_i = keccak256(cipher_i) → content-addressed IPFS fragment.
  *      All cid_{i-1} recorded in the index → any k_i is O(1) derivable (newest-first restore).
+ *  - HEAD POINTER (mutable): the encrypted index cipher is itself a content-addressed IPFS fragment
+ *      (indexHash = keccak256(cipher)). The *latest* indexHash is recorded on-chain in `ChatIndexRegistry`
+ *      via an EIP-712 `SetPointer(owner,indexHash,ts,seq,nonce)` signed offline by the EOA; a gasless API
+ *      relayer pays gas. Only the owner's signature can move the owner's pointer (write right = private key).
+ *      Read path is pure RPC `getPointer(eoa)` (no mutable server state). Replaces the old `point-${L}` alias.
  *
  * Trust rule: a failed/untrusted network read must NOT clobber the local IndexedDB
  * mirror (repo `beamio-trusted-vs-untrusted-fetch`).
@@ -25,6 +29,22 @@ import {
 	hkdf,
 	keccakUtf8,
 } from '../crypto.js'
+
+/** ChatIndexRegistry lives only on CoNET L1; EIP-712 domain chainId is fixed. */
+const REGISTRY_CHAIN_ID = 224422
+const REGISTRY_READ_ABI = [
+	'function getPointer(address) view returns (bytes32 indexHash,uint64 ts,uint64 seq,uint64 updatedAt)',
+	'function nonceOf(address) view returns (uint256)',
+] as const
+const SET_POINTER_TYPES = {
+	SetPointer: [
+		{ name: 'owner', type: 'address' },
+		{ name: 'indexHash', type: 'bytes32' },
+		{ name: 'ts', type: 'uint64' },
+		{ name: 'seq', type: 'uint64' },
+		{ name: 'nonce', type: 'uint256' },
+	],
+} as const
 
 interface IndexRecord {
 	seq: number
@@ -55,7 +75,6 @@ const FRAGMENT_GENESIS_INFO = 'frag-genesis'
 
 export class HistoryStore {
 	private master: Uint8Array | null = null
-	private locator = ''
 	private indexKey: Uint8Array | null = null
 	private genesisCid = ''
 	private manifest: IndexManifest | null = null
@@ -64,6 +83,8 @@ export class HistoryStore {
 	/** Cached signer + its self-address EIP-191 signature (storageFragment auth). */
 	private wallet: ethers.Wallet | null = null
 	private selfSign = ''
+	/** Lazily-created read-only CoNET provider (RPC-first pointer reads). */
+	private provider: ethers.JsonRpcProvider | null = null
 
 	constructor(
 		private readonly emit: HistoryEmit,
@@ -73,6 +94,9 @@ export class HistoryStore {
 			chainId: number
 			ipfsBaseUrl: string
 			ipfsWriteBaseUrl?: string
+			conetRpcUrl: string
+			chatIndexRegistryAddress: string
+			apiBaseUrl?: string
 			persistence?: PersistenceAdapter
 		},
 	) {}
@@ -82,6 +106,13 @@ export class HistoryStore {
 	}
 	private get readBase(): string {
 		return this.opts.ipfsBaseUrl.replace(/\/$/, '')
+	}
+	private getProvider(): ethers.JsonRpcProvider {
+		if (!this.provider) {
+			const net = new ethers.Network('conet', REGISTRY_CHAIN_ID)
+			this.provider = new ethers.JsonRpcProvider(this.opts.conetRpcUrl, net, { staticNetwork: net })
+		}
+		return this.provider
 	}
 
 	async init(): Promise<void> {
@@ -95,22 +126,40 @@ export class HistoryStore {
 		const domain = `beamio.chat.history.v1|${this.opts.chainId}|${this.eoaLower}`
 		const sig = await wallet.signMessage(domain)
 		this.master = hexToBytes(keccakUtf8(sig))
-		const locatorBytes = await hkdf(this.master, 'index-locator', 32)
-		this.locator = `point-${ethers.hexlify(locatorBytes)}`
 		this.indexKey = await hkdf(this.master, 'index-enc', 32)
 		const genesisBytes = await hkdf(this.master, FRAGMENT_GENESIS_INFO, 32)
 		this.genesisCid = ethers.hexlify(genesisBytes)
 		this.ready = true
 	}
 
-	// ---- Locator / index ------------------------------------------------------
+	// ---- On-chain head pointer / index ---------------------------------------
+	/** Local mirror is keyed per-EOA (index cipher changes each append). */
 	private localIndexKey(): string {
-		return `${LOCAL_INDEX_KEY_PREFIX}${this.locator}`
+		return `${LOCAL_INDEX_KEY_PREFIX}${this.eoaLower}`
 	}
 
-	private async fetchIndexCipherFromNetwork(): Promise<string | null> {
+	/** Read the on-chain head pointer (RPC-first). Returns null when unset/unreachable. */
+	private async readOnchainPointer(): Promise<{ indexHash: string; ts: bigint; seq: bigint } | null> {
 		try {
-			const url = `${this.readBase}/getFragment?hash=${encodeURIComponent(this.locator)}`
+			const registry = new ethers.Contract(
+				this.opts.chatIndexRegistryAddress,
+				REGISTRY_READ_ABI,
+				this.getProvider(),
+			)
+			const ptr = await registry.getPointer!(ethers.getAddress(this.eoaLower))
+			const indexHash = String(ptr[0])
+			if (!indexHash || indexHash === ethers.ZeroHash) return null
+			return { indexHash, ts: BigInt(ptr[1].toString()), seq: BigInt(ptr[2].toString()) }
+		} catch (ex) {
+			this.emit.log('warn', `readOnchainPointer error: ${(ex as Error)?.message ?? String(ex)}`)
+			return null
+		}
+	}
+
+	/** Fetch the encrypted index cipher by its content hash. */
+	private async fetchIndexCipherByHash(indexHash: string): Promise<string | null> {
+		try {
+			const url = `${this.readBase}/getFragment?hash=${encodeURIComponent(indexHash)}`
 			const res = await fetch(url, { method: 'GET', cache: 'no-store' })
 			if (!res.ok) return null
 			const text = (await res.text()).trim()
@@ -135,23 +184,26 @@ export class HistoryStore {
 			}
 		}
 		if (localOnly) return this.manifest
-		// Network refresh (trusted-only overwrite).
-		const cipher = await this.fetchIndexCipherFromNetwork()
-		if (cipher && this.indexKey) {
-			try {
-				const json = await aesGcmDecryptString(this.indexKey, cipher)
-				const parsed = JSON.parse(json) as IndexManifest
-				if (parsed?.v === 1) {
-					// Only overwrite when network is at least as complete as local (trusted).
-					const netLen = parsed.records?.length ?? 0
-					const localLen = this.manifest?.records?.length ?? 0
-					if (netLen >= localLen) {
-						this.manifest = parsed
-						if (this.opts.persistence) await this.opts.persistence.set(this.localIndexKey(), cipher)
+		// Network refresh (trusted-only overwrite): resolve on-chain head pointer → fetch index cipher.
+		const pointer = await this.readOnchainPointer()
+		if (pointer) {
+			const cipher = await this.fetchIndexCipherByHash(pointer.indexHash)
+			if (cipher && this.indexKey) {
+				try {
+					const json = await aesGcmDecryptString(this.indexKey, cipher)
+					const parsed = JSON.parse(json) as IndexManifest
+					if (parsed?.v === 1) {
+						// Only overwrite when network is at least as complete as local (trusted).
+						const netLen = parsed.records?.length ?? 0
+						const localLen = this.manifest?.records?.length ?? 0
+						if (netLen >= localLen) {
+							this.manifest = parsed
+							if (this.opts.persistence) await this.opts.persistence.set(this.localIndexKey(), cipher)
+						}
 					}
+				} catch {
+					/* untrusted parse — keep local */
 				}
-			} catch {
-				/* untrusted parse — keep local */
 			}
 		}
 		return this.manifest
@@ -162,12 +214,66 @@ export class HistoryStore {
 		const json = JSON.stringify(this.manifest)
 		const cipher = await aesGcmEncryptString(this.indexKey, json)
 		if (this.opts.persistence) await this.opts.persistence.set(this.localIndexKey(), cipher)
-		// Re-point server alias `point-${L}` at the fresh index cipher.
-		await this.uploadFragment(cipher, this.locator)
+		// Upload the fresh index cipher as a content-addressed fragment, then move the on-chain head pointer.
+		const indexHash = await this.uploadFragment(cipher)
+		if (indexHash) await this.updateOnchainPointer(indexHash)
+	}
+
+	/**
+	 * Move the EOA's on-chain head pointer to `indexHash` via the gasless relay.
+	 * The EOA signs `SetPointer(owner,indexHash,ts,seq,nonce)` (EIP-712); the API relayer pays gas.
+	 * No-op (with a warning) when `apiBaseUrl` is not configured.
+	 */
+	private async updateOnchainPointer(indexHash: string): Promise<void> {
+		if (!this.wallet) return
+		if (!this.opts.apiBaseUrl) {
+			this.emit.log('warn', 'chat history: apiBaseUrl unset — on-chain head pointer not updated')
+			return
+		}
+		if (!ethers.isHexString(indexHash, 32)) {
+			this.emit.log('warn', `chat history: bad indexHash ${indexHash}`)
+			return
+		}
+		try {
+			const nonce = await new ethers.Contract(
+				this.opts.chatIndexRegistryAddress,
+				REGISTRY_READ_ABI,
+				this.getProvider(),
+			).nonceOf!(this.wallet.address)
+			// ts = client monotonic timestamp (ms); seq = monotonic append count. Both non-decreasing.
+			const ts = BigInt(Date.now())
+			const seq = BigInt(this.manifest?.records?.length ?? 0)
+			const domain = {
+				name: 'ChatIndexRegistry',
+				version: '1',
+				chainId: REGISTRY_CHAIN_ID,
+				verifyingContract: this.opts.chatIndexRegistryAddress,
+			}
+			const value = { owner: this.wallet.address, indexHash, ts, seq, nonce: BigInt(nonce.toString()) }
+			const signature = await this.wallet.signTypedData(domain, SET_POINTER_TYPES as never, value)
+			const base = this.opts.apiBaseUrl.replace(/\/$/, '')
+			const res = await fetch(`${base}/setChatIndexPointer`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					owner: this.wallet.address,
+					indexHash,
+					ts: ts.toString(),
+					seq: seq.toString(),
+					nonce: nonce.toString(),
+					signature,
+				}),
+			})
+			if (!res.ok) {
+				this.emit.log('warn', `setChatIndexPointer HTTP ${res.status}`)
+			}
+		} catch (ex) {
+			this.emit.log('warn', `updateOnchainPointer error: ${(ex as Error)?.message ?? String(ex)}`)
+		}
 	}
 
 	// ---- Fragment upload/download --------------------------------------------
-	private async uploadFragment(cipherB64: string, pointer?: string): Promise<string | null> {
+	private async uploadFragment(cipherB64: string): Promise<string | null> {
 		if (!this.wallet) throw new Error('history not initialised')
 		const contentHash = keccakUtf8(cipherB64)
 		// storageFragment contract: { wallet, signMessage, image }. `image` is the raw
@@ -176,19 +282,6 @@ export class HistoryStore {
 			wallet: this.wallet.address,
 			signMessage: this.selfSign,
 			image: cipherB64,
-		}
-		if (pointer) {
-			// point-${L} alias: EOA-signed, owner-bound (see fragmentClusterServer upgrade).
-			try {
-				const ts = Math.floor(Date.now() / 1000)
-				const pointerSig = await this.wallet.signMessage(`${pointer}|${contentHash}|${ts}`)
-				body.pointer = pointer
-				body.pointerOwner = this.wallet.address
-				body.pointerTs = ts
-				body.pointerSig = pointerSig
-			} catch {
-				/* pointer optional */
-			}
 		}
 		try {
 			const res = await fetch(`${this.writeBase}/storageFragment`, {
@@ -319,6 +412,8 @@ export class HistoryStore {
 		this.master = null
 		this.indexKey = null
 		this.manifest = null
+		this.provider?.destroy?.()
+		this.provider = null
 		this.ready = false
 	}
 

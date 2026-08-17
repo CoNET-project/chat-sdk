@@ -1,4 +1,4 @@
-# @conet-project/chat-sdk
+# @conet.project/chat-sdk
 
 Beamio CoNET Chat SDK — **runs the gossip transport entirely inside a Web Worker** (zero main-thread `openpgp` decrypt/encrypt, zero `ethers.verifyMessage`), plus **fragmented, symmetrically-encrypted IPFS history**. UI-agnostic, reusable across SilentPassUI / bizSite / Alliance / POS.
 
@@ -10,7 +10,7 @@ Beamio CoNET Chat SDK — **runs the gossip transport entirely inside a Web Work
 
 - **Worker-first**: every heavy crypto operation runs inside the Worker; the UI never blocks.
 - **UI-agnostic**: pure TS/ESM + `.d.ts`, no React and no app-specific imports. The host injects private keys, RPC, node discovery, IPFS, and persistence.
-- **Zero-trust routing built in**: send via entry A, listen via entry C (≠ mailbox B), `listenKind:'chat'`, business messages encrypted to the recipient's **EOA user PGP**, delivery ACK encrypted to the route B key.
+- **Zero-trust routing built in**: send via entry A, listen via entry C (≠ mailbox B), `listenKind:'chat'` + `algorithm:'aes-256-cbc'` + `Securitykey`, business messages encrypted to the recipient's **EOA user PGP**, delivery ACK encrypted to the route B key. Each POST wraps inner armor to **that entry's** route public key. Clients never set `X-CoNET-Hop-Sigs`.
 - **Encrypted fragmented history**: HKDF domain separation + ratcheting fragment keys + AES-256-GCM fragments + encrypted index manifest + server-side `point-` pointers + IndexedDB local-first.
 - **Private keys never persist inside the SDK**: keys are used only in Worker memory to derive an `ethers.Wallet` and the history master. The host decides whether to persist locally (consumers/POS may store; bizSite keeps session memory only).
 
@@ -43,7 +43,7 @@ Beamio CoNET Chat SDK — **runs the gossip transport entirely inside a Web Work
 Install as a dependency (per `src-subprojects-are-independent`: each sub-project owns formal dependencies; never cross-`../..` import).
 
 ```bash
-npm install @conet-project/chat-sdk
+npm install @conet.project/chat-sdk
 ```
 
 Peer dependencies (provided by the host):
@@ -62,7 +62,7 @@ Runtime: a browser / WebView with `Worker` + `crypto.subtle` (PWA inside iOS/And
 The host creates the Worker (the SDK does not hardcode a worker URL, to stay bundler-agnostic):
 
 ```ts
-import { createBeamioChatClient, type BeamioChatConfig } from '@conet-project/chat-sdk'
+import { createBeamioChatClient, type BeamioChatConfig } from '@conet.project/chat-sdk'
 
 const config: BeamioChatConfig = {
   identity: {
@@ -82,7 +82,7 @@ const config: BeamioChatConfig = {
 
 const client = createBeamioChatClient(config, {
   workerFactory: () =>
-    new Worker(new URL('@conet-project/chat-sdk/worker', import.meta.url), { type: 'module' }),
+    new Worker(new URL('@conet.project/chat-sdk/worker', import.meta.url), { type: 'module' }),
 })
 
 await client.init()                 // start Worker + inject keys/nodes; the Worker begins listening
@@ -100,7 +100,7 @@ client.setRoutes(myContactRoutes)
 
 | Environment | `workerFactory` |
 |---|---|
-| **Vite** | `() => new Worker(new URL('@conet-project/chat-sdk/worker', import.meta.url), { type: 'module' })` |
+| **Vite** | `() => new Worker(new URL('@conet.project/chat-sdk/worker', import.meta.url), { type: 'module' })` |
 | **Webpack 5 / CRA (Craco)** | same as above; Webpack 5 statically recognizes `new Worker(new URL(...))` and emits a separate worker chunk |
 | **Vendored (see below)** | `() => new Worker(new URL('../vendor/beamio-chat-sdk/worker/entry.ts', import.meta.url), { type: 'module', name: 'beamio-chat-gossip' })` |
 
@@ -117,7 +117,7 @@ client.setRoutes(myContactRoutes)
 | `ipfsBaseUrl` | `string` | IPFS fragment gateway base, e.g. `https://ipfs.conet.network/api` |
 | `ipfsWriteBaseUrl?` | `string` | IPFS write base (defaults to `ipfsBaseUrl`) |
 | `persistence?` | `PersistenceAdapter` | IndexedDB adapter (optional; history is memory-only without it) |
-| `runtime?` | `ChatRuntimeOptions` | `sendFanout` (default 3), `reconnectBaseMs` (4000), `reconnectMaxMs` (30000) |
+| `runtime?` | `ChatRuntimeOptions` | `sendFanout` (default 3), `reconnectBaseMs` (4000), `reconnectMaxMs` (30000), `outerWrap` (default `true`) |
 | `chainId?` | `number` | chainId in the history-master derivation domain (default `224422` CoNET L1) |
 
 ### `ChatIdentity` (key injection)
@@ -151,7 +151,7 @@ client.setRoutes(myContactRoutes)
 | Method | Description |
 |---|---|
 | `init(): Promise<void>` | start Worker, inject config/nodes; the Worker begins listening. Idempotent (no-op if already running) |
-| `sendMessage(to, payload, opts?)` | encrypt and send a business payload to a contact via entry A ≠ B. Returns `{ sendId }` |
+| `sendMessage(to, payload, opts?)` | encrypt and send a business payload to a contact via entry A ≠ B. `opts.beamioNoPush` wraps `{ data, NoPush: true }` to the contact mailbox route key (sender receipts). HTTP stays `{ data }` only. Returns `{ sendId }` |
 | `queryPresence(contacts)` | probe mailbox listen-pool presence; returns `Record<addrLower, boolean>` (only `ok:true` counts) |
 | `setRoutes(routes)` | update the set of contacts to listen for / probe |
 | `setNodes(nodes)` | push a refreshed node snapshot (host owns discovery) |
@@ -186,12 +186,18 @@ client.setRoutes(myContactRoutes)
 
 ## Zero-trust routing (built into the SDK)
 
-Follows `conet-p2p-mailbox-routing-protocol` and `beamio-conet-chat-protocol`:
+Follows `src/docs/gitbook/l0/si-developer-guide.md`, `conet-p2p-mailbox-routing-protocol`, and `beamio-conet-chat-protocol`:
 
+- **POST `/post`**: body is **only** `{ data: "<OpenPGP armor>" }`. Never add sibling fields.
 - **Send business messages**: encrypt to the recipient's **EOA user PGP**, POST to a healthy **entry A ≠ mailbox B**.
-- **Recipient listen**: encrypt to the **mailbox B route key**, SSE-connect via **entry C ≠ B**, and always include `listenKind:'chat'`.
-- **Delivery ACK**: encrypt to the **mailbox B route key**.
+- **Mailbox work / `NoPush`**: if mailbox B must skip APNs, wrap `{ data: <user-PGP armor>, NoPush: true }` to **B route PGP**, then POST that armor as `{ data }` (optional entry wrap). Do not put `NoPush` on the HTTP JSON.
+- **Recipient listen**: encrypt `{ command:'mining', listenKind:'chat', algorithm:'aes-256-cbc', Securitykey }` to the **mailbox B route key**, SSE-connect via **entry C ≠ B**. Omitting `listenKind` is treated as mining.
+- **Delivery ACK / presence**: encrypt the SI command to the **mailbox B route key**, POST via **entry C ≠ B**.
+- **Outer wrap (default `runtime.outerWrap: true`)**: after the inner armor is built, encrypt that **raw armor string** again to **this POST's entry** route public key. Each fan-out entry is wrapped separately. Skip wrap when the entry key equals the inner encryption key (SI same-node peel → `end`).
+- **Hop-sigs**: clients **must not** set `X-CoNET-Hop-Sigs`. Only SI→SI HTTP `:80` appends it (max 3 hops).
+- **SSE inbound**: live SI still writes plaintext JSON `{ data: pgpMessage }`. Keep sending `Securitykey` on listen; do not assume AES-CBC frames yet.
 - Never connect directly to mailbox B; never target the recipient's AA (must be EOA user PGP).
+- Client → entry may use HTTPS (PWA default). SI→SI is HTTP `:80` only.
 
 ---
 
@@ -242,7 +248,9 @@ In `services/chat.ts`, `connectToGossipNode` only parses routes + healthy entrie
 
 - Private keys / plaintext / full ciphertext **must never be logged**; `log` events emit structured summaries only.
 - The history `master` lives only in Worker memory; consumers/POS may store keys locally, bizSite keeps session memory only (policy owned by the host; the SDK never self-persists).
-- Always send `listenKind:'chat'`; never connect directly to mailbox B.
+- Always send `listenKind:'chat'` + `Securitykey`; never connect directly to mailbox B.
+- Never set `X-CoNET-Hop-Sigs` on client `POST /post`.
+- Sender receipts should use `sendMessage(..., { beamioNoPush: true })` (mailbox work wrap; requires the sender mailbox route key).
 - `point-` has CoNET-private semantics; public-gateway retrieval relies on CIDv1 mapping and must be documented.
 
 ---
@@ -262,7 +270,8 @@ src/
   protocol.ts       # main ↔ worker postMessage protocol
   types.ts          # public types (UI-agnostic)
   crypto.ts         # WebCrypto + keccak/HKDF/AES-GCM (worker & main thread)
-  nodes.ts          # node probing (worker & main thread)
+  envelope.ts       # POST body, route-command encrypt, per-entry outer wrap
+  nodes.ts          # node probing + `postUrl` (worker & main thread)
   worker/
     entry.ts        # worker entry (imported only in a Worker context)
     gossip-core.ts  # SSE + openpgp decrypt/encrypt + sign + presence + ACK
@@ -273,13 +282,14 @@ Package exports:
 
 | Entry | Usage |
 |---|---|
-| `@conet-project/chat-sdk` | main-thread API (`createBeamioChatClient` + types) |
-| `@conet-project/chat-sdk/worker` | worker entry; **only** used as the target of `new Worker(...)` |
+| `@conet.project/chat-sdk` | main-thread API (`createBeamioChatClient` + types) |
+| `@conet.project/chat-sdk/worker` | worker entry; **only** used as the target of `new Worker(...)` |
 
 ---
 
 ## Related rules / references
 
+- `src/docs/gitbook/l0/si-developer-guide.md` — SI `/post` peel, outer wrap, hop-sigs
 - `conet-p2p-mailbox-routing-protocol` / `beamio-conet-chat-protocol` — routing and envelopes
 - `conet-depin-chat-app-dev` — app practices (receipts / presence / listenKind)
 - `beamio-trusted-vs-untrusted-fetch` — failures never overwrite trusted local state

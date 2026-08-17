@@ -49,6 +49,9 @@ function makeHistory(payload: WorkerInitPayload): HistoryStore {
 			chainId: payload.chainId,
 			ipfsBaseUrl: payload.ipfsBaseUrl,
 			ipfsWriteBaseUrl: payload.ipfsWriteBaseUrl,
+			conetRpcUrl: payload.conetRpcUrl,
+			chatIndexRegistryAddress: payload.chatIndexRegistryAddress,
+			apiBaseUrl: payload.apiBaseUrl,
 			// PersistenceAdapter cannot cross the worker boundary (functions aren't
 			// clonable). The worker uses its own IndexedDB-backed adapter instead.
 			persistence: createWorkerPersistence(),
@@ -130,7 +133,7 @@ async function handle(cmd: WorkerInbound): Promise<void> {
 			return
 		case 'send': {
 			try {
-				const ok = await gossip!.send(cmd.to, cmd.payload)
+				const ok = await gossip!.send(cmd.to, cmd.payload, { beamioNoPush: cmd.beamioNoPush })
 				post({ type: 'ack', reqId: cmd.reqId, ok: true, result: { sent: ok, sendId: cmd.sendId } })
 			} catch (ex) {
 				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })

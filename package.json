@@ -1,5 +1,5 @@
 {
-  "name": "@conet-project/chat-sdk",
+  "name": "@conet.project/chat-sdk",
   "version": "0.1.0",
   "description": "Beamio CoNET Chat SDK — gossip messaging in a Web Worker (zero main-thread openpgp/verify) + encrypted fragmented IPFS history. UI-agnostic, reusable across SilentPassUI / bizSite / Alliance / POS.",
   "type": "module",
@@ -45,6 +45,6 @@
   },
   "sideEffectsNote": "Worker entry (./worker) is a side-effectful module; import only inside a Worker context.",
   "publishConfig": {
-    "access": "restricted"
+    "access": "public"
   }
 }

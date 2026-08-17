@@ -26,6 +26,10 @@ export interface WorkerInitPayload {
 	ipfsBaseUrl: string
 	ipfsWriteBaseUrl?: string
 	chainId: number
+	/** ChatIndexRegistry proxy (on-chain encrypted-history head pointer). */
+	chatIndexRegistryAddress: string
+	/** Cluster API base for the gasless index-pointer relay (optional). */
+	apiBaseUrl?: string
 	runtime: Required<ChatRuntimeOptions>
 	/** Initial node snapshot (worker requests refreshes via `nodesRequest`). */
 	nodes: NodeInfo[]
@@ -38,12 +42,17 @@ export type WorkerCommand =
 	| { type: 'init'; reqId: number; payload: WorkerInitPayload }
 	| { type: 'setRoutes'; routes: ChatRoute[] }
 	| { type: 'setNodes'; nodes: NodeInfo[] }
-	| { type: 'send'; reqId: number; to: ChatRoute; payload: string; sendId: string }
+	| { type: 'send'; reqId: number; to: ChatRoute; payload: string; sendId: string; beamioNoPush?: boolean }
 	| { type: 'queryPresence'; reqId: number; contacts: ChatRoute[] }
 	| { type: 'historyLoad'; reqId: number; options?: HistoryLoadOptions }
 	| { type: 'historyAppend'; reqId: number; entry: Omit<HistoryEntry, 'seq'> }
 	/** Encrypt an arbitrary mailbox command (e.g. gossip_delivery_ack) to route B and POST via entry C ≠ B. */
-	| { type: 'mailboxCommand'; reqId: number; routerArmoredPublicKey: string; command: Record<string, unknown> }
+	| {
+			type: 'mailboxCommand'
+			reqId: number
+			routerArmoredPublicKey: string
+			command: Record<string, unknown>
+	  }
 	| { type: 'pause' }
 	| { type: 'resume' }
 	| { type: 'destroy' }

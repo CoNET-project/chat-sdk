@@ -4,7 +4,14 @@
  *
  * Routing rule reminder: send business payloads to entry A ≠ mailbox B; listen via
  * entry C ≠ B. Mailbox B is identified by matching the contact route armored key.
+ * Client → entry uses HTTPS by default (PWA mixed-content). Never set
+ * `X-CoNET-Hop-Sigs` on these requests.
  */
+
+/** `{https|http}://{domain}.conet.network/post` — SI developer guide `postUrl`. */
+export function postUrl(domain: string, https = true): string {
+	return `${https ? 'https' : 'http'}://${domain}.conet.network/post`
+}
 
 import type { NodeInfo } from './types.js'
 
@@ -57,10 +64,10 @@ export { postWithTimeout }
 
 const probeGossipNode = async (node: NodeInfo, timeoutMs = 4_000): Promise<boolean> => {
 	const origin = (self as unknown as { location?: { origin?: string } }).location?.origin || 'https://beamio.app'
-	const postUrl = `https://${node.domain}.conet.network/post`
+	const url = postUrl(node.domain)
 	try {
 		const res = await postWithTimeout(
-			postUrl,
+			url,
 			{
 				method: 'OPTIONS',
 				headers: {
