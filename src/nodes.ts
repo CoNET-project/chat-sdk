@@ -1,6 +1,6 @@
 /**
  * Node selection + health helpers. Runtime-agnostic (Worker-safe: uses `fetch`,
- * `self` timers). Ported from SilentPassUI `services/chat.ts` with window.* removed.
+ * `globalThis` timers). Ported from SilentPassUI `services/chat.ts` with window.* removed.
  *
  * Routing rule reminder: send business payloads to entry A ≠ mailbox B; listen via
  * entry C ≠ B. Mailbox B is identified by matching the contact route armored key.
@@ -8,12 +8,12 @@
  * `X-CoNET-Hop-Sigs` on these requests.
  */
 
+import type { NodeInfo } from './types.js'
+
 /** `{https|http}://{domain}.conet.network/post` — SI developer guide `postUrl`. */
 export function postUrl(domain: string, https = true): string {
 	return `${https ? 'https' : 'http'}://${domain}.conet.network/post`
 }
-
-import type { NodeInfo } from './types.js'
 
 export const getRandomNode = (allNodes: NodeInfo[]): NodeInfo | null => {
 	if (!allNodes.length) return null
@@ -63,7 +63,7 @@ async function postWithTimeout(url: string, init: RequestInit, timeoutMs = 12_00
 export { postWithTimeout }
 
 const probeGossipNode = async (node: NodeInfo, timeoutMs = 4_000): Promise<boolean> => {
-	const origin = (self as unknown as { location?: { origin?: string } }).location?.origin || 'https://beamio.app'
+	const origin = (globalThis as { location?: { origin?: string } }).location?.origin || 'https://beamio.app'
 	const url = postUrl(node.domain)
 	try {
 		const res = await postWithTimeout(
