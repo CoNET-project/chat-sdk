@@ -103,6 +103,12 @@ const probeGossipNode = async (node: NodeInfo, timeoutMs = 4_000): Promise<boole
 	return false
 }
 
+/** Entry C pool for listen. Never require GET / health — that homepage has no CORS. */
+export function pickListenEntryNodes(pool: NodeInfo[], excludeDomains?: Set<string>): NodeInfo[] {
+	const filtered = excludeDomains?.size ? pool.filter((n) => !excludeDomains.has(n.domain)) : pool
+	return filtered.length ? filtered : pool
+}
+
 export const pickHealthyGossipNodes = async (nodes: NodeInfo[]): Promise<NodeInfo[]> => {
 	if (!nodes.length) return []
 	const cached = nodes.filter((n) => isGossipNodeHealthy(n.domain))

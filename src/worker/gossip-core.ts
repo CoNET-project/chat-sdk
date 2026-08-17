@@ -38,7 +38,7 @@ import {
 	markGossipNodeBad,
 	markGossipNodeHealthy,
 	pickGossipEntryNodesForSend,
-	pickHealthyGossipNodes,
+	pickListenEntryNodes,
 	pickRouteNodesByArmoredKey,
 	postUrl,
 	postWithTimeout,
@@ -84,7 +84,8 @@ function extractGossipListingBlockHeight(payload: unknown): string | null {
 function isGossipListingLivenessFrame(payload: unknown): boolean {
 	if (!payload || typeof payload !== 'object') return false
 	const row = payload as Record<string, unknown>
-	return typeof row.ipaddress === 'string' || 'nodeWallets' in row
+	if (typeof row.ipaddress === 'string' || 'nodeWallets' in row) return true
+	return row.status != null && row.epoch != null
 }
 
 export class GossipCore {
@@ -183,13 +184,15 @@ export class GossipCore {
 
 		// Resolve mailbox B route from the identity's own route (host injects own route key).
 		const ownRouteKey = this.cfg.identity.ownRouteArmoredPublicKey || ''
-		const routeNodes = pickRouteNodesByArmoredKey(this.nodes, ownRouteKey)
-		if (!ownRouteKey || !routeNodes.length) {
-			// Ask host to refresh nodes; retry shortly.
-			this.emit.log('warn', 'listen: no route node for own mailbox key; awaiting nodes')
-			this.emit.status('reconnecting', 'awaiting_route_nodes')
+		if (!ownRouteKey) {
+			this.emit.log('warn', 'listen: empty mailbox route key; awaiting identity')
+			this.emit.status('reconnecting', 'awaiting_route_key')
 			setTimeout(() => void this.startListen(), 6_000)
 			return
+		}
+		const routeNodes = pickRouteNodesByArmoredKey(this.nodes, ownRouteKey)
+		if (!routeNodes.length) {
+			this.emit.log('warn', 'listen: mailbox B not in Guardian list; posting via any entry')
 		}
 		const mailboxDomains = new Set(routeNodes.map((n) => n.domain))
 
@@ -213,10 +216,9 @@ export class GossipCore {
 				ownRouteKey,
 			)
 
-			const entryCandidates = this.nodes.filter((n) => !mailboxDomains.has(n.domain))
-			const healthyNodes = await pickHealthyGossipNodes(entryCandidates.length ? entryCandidates : this.nodes)
-			if (!healthyNodes.length) {
-				this.emit.log('warn', 'listen: no healthy entry C; retry')
+			const listenEntries = pickListenEntryNodes(this.nodes, mailboxDomains)
+			if (!listenEntries.length) {
+				this.emit.log('warn', 'listen: empty node pool; retry')
 				this.emit.status('reconnecting', 'no_entry_c')
 				this.clearListen('connect_failed')
 				setTimeout(() => void this.startListen(), 6_000)
@@ -224,11 +226,12 @@ export class GossipCore {
 			}
 			this.ackContext = {
 				routerArmoredPublicKey: ownRouteKey,
-				entryNodes: healthyNodes,
+				entryNodes: listenEntries,
 				mailboxDomains: [...mailboxDomains],
 			}
 
-			this.spawnGossip(healthyNodes, innerArmor, rootSignal)
+			this.emit.log('info', `listen starting via POST /post entries=${listenEntries.length}`)
+			this.spawnGossip(listenEntries, innerArmor, rootSignal)
 			this.emit.status('listening')
 		} catch (ex) {
 			this.emit.log('error', `startListen error: ${(ex as Error)?.message ?? String(ex)}`)
@@ -311,10 +314,10 @@ export class GossipCore {
 				markGossipNodeHealthy(node.domain)
 				this.lastActivityAt = Date.now()
 				reconnectAttempt = 0
+				this.emit.log('info', `listen SSE open entry=${node.domain}`)
 				reader = res.body.getReader()
 				const decoder = new TextDecoder('utf-8')
 				let buffer = ''
-				let first = true
 				resetIdle()
 
 				while (true) {
@@ -360,10 +363,6 @@ export class GossipCore {
 						const dataLines = lines.filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart())
 						const payload = (dataLines.length ? dataLines.join('\n') : block).trim()
 						if (!payload) continue
-						if (first) {
-							first = false
-							continue
-						}
 						await this.handleInbound(payload, node.domain, rootSignal)
 					}
 				}
@@ -419,7 +418,9 @@ export class GossipCore {
 			// own foreground/background staleness timer fresh (parity with the old
 			// main-thread noteGossipActivity() that fired on every frame).
 			this.lastActivityAt = Date.now()
+			const height = extractGossipListingBlockHeight(data)
 			this.emit.status('listening', 'heartbeat')
+			this.emit.log('info', height ? `heartbeat epoch=${height}` : 'heartbeat')
 			return
 		}
 		try {
@@ -445,8 +446,12 @@ export class GossipCore {
 				this.emit.message(JSON.stringify(data), undefined, true, viaDomain)
 			}
 		} catch (ex: unknown) {
-			if ((ex as Error)?.message?.includes?.('No decryption key packets found')) return
-			this.emit.log('warn', `inbound parse error: ${(ex as Error)?.message ?? String(ex)}`)
+			const msg = (ex as Error)?.message ?? String(ex)
+			if (msg.includes('No decryption key packets found')) {
+				this.emit.log('warn', 'inbound PGP is not for this listen key (stale contact publicArmored or wrong recipient)')
+				return
+			}
+			this.emit.log('warn', `inbound parse error: ${msg}`)
 		}
 	}
 
