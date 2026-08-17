@@ -232,7 +232,6 @@ export class GossipCore {
 
 			this.emit.log('info', `listen starting via POST /post entries=${listenEntries.length}`)
 			this.spawnGossip(listenEntries, innerArmor, rootSignal)
-			this.emit.status('listening')
 		} catch (ex) {
 			this.emit.log('error', `startListen error: ${(ex as Error)?.message ?? String(ex)}`)
 			this.clearListen('connect_failed')
@@ -279,11 +278,12 @@ export class GossipCore {
 			setTimeout(() => {
 				if (rootSignal.aborted) return
 				this.emit.log('info', `reconnecting entry C attempt=${nextAttempt} reason=${reason || 'stream_end'}`)
-				this.spawnGossip(nodes, innerArmor, rootSignal, timeoutConfig, nextAttempt)
+				const remaining = nodes.filter((n) => n.domain !== node.domain)
+				this.spawnGossip(remaining.length ? remaining : nodes, innerArmor, rootSignal, timeoutConfig, nextAttempt)
 			}, delay)
 		}
 
-		const connectTimer = setTimeout(() => controller.abort('connect_timeout'), config.connectTimeout)
+		let connectTimer: ReturnType<typeof setTimeout> | null = null
 		let idleTimer: ReturnType<typeof setTimeout> | null = null
 		const resetIdle = () => {
 			if (idleTimer) clearTimeout(idleTimer)
@@ -298,6 +298,7 @@ export class GossipCore {
 					this.cfg?.runtime.outerWrap === false
 						? innerArmor
 						: await wrapArmorToEntryRoute(innerArmor, node.armoredPublicKey)
+				connectTimer = setTimeout(() => controller.abort('connect_timeout'), config.connectTimeout)
 				const res = await fetch(url, {
 					method: 'POST',
 					headers: {
@@ -309,11 +310,12 @@ export class GossipCore {
 					signal: controller.signal,
 					cache: 'no-store',
 				})
-				clearTimeout(connectTimer)
+				if (connectTimer) clearTimeout(connectTimer)
 				if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
 				markGossipNodeHealthy(node.domain)
 				this.lastActivityAt = Date.now()
 				reconnectAttempt = 0
+				this.emit.status('listening')
 				this.emit.log('info', `listen SSE open entry=${node.domain}`)
 				reader = res.body.getReader()
 				const decoder = new TextDecoder('utf-8')
@@ -368,7 +370,7 @@ export class GossipCore {
 				}
 				triggerRelaunch('server_closed')
 			} catch (err: unknown) {
-				clearTimeout(connectTimer)
+				if (connectTimer) clearTimeout(connectTimer)
 				if (idleTimer) clearTimeout(idleTimer)
 				const msg = this.resolveAbortReason(err, controller, rootSignal)
 				if (GOSSIP_STOP_REASONS.has(msg)) return
