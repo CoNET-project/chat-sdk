@@ -9,8 +9,9 @@
  * `beamio-conet-chat-protocol`, and `src/docs/gitbook/l0/si-developer-guide.md`):
  *  - Send business payloads encrypted to the recipient EOA *user* PGP, POSTed to an
  *    entry node A ≠ mailbox B.
- *  - Listen SSE is encrypted to mailbox B route key, connected via entry C ≠ B, and
- *    MUST carry `listenKind: 'chat'`.
+ *  - New Chat listen SSE is encrypted to mailbox B route key, connected via entry
+ *    C ≠ B, and uses `command: 'mailbox_listen'` with an opaque `instanceId`.
+ *    Legacy clients may use `mining` with `listenKind: 'chat'`.
  *  - Delivery ACK is encrypted to the mailbox B route key.
  *  - Each POST wraps that inner armor to **that entry's** route public key (peel at
  *    the entry). Clients never set `X-CoNET-Hop-Sigs`.
@@ -58,6 +59,41 @@ export interface ChatRoute {
 	routerArmoredPublicKey?: string
 	routePgpKeyID?: string
 }
+
+export type VoiceCallSignalType =
+	| 'voice_call_offer_v1'
+	| 'voice_call_accept_v1'
+	| 'voice_call_reject_v1'
+	| 'voice_end_v1'
+
+export interface VoiceCallSignal {
+	type: VoiceCallSignalType
+	callId: string
+	sessionId: string
+	from: string
+	to: string
+	createdAt: number
+	expiresAt: number
+	sessionKey?: string
+	peerSessionId?: string
+	codec?: string
+	reason?: string
+}
+
+export interface VoiceFrame {
+	type: 'voice_frame_v1'
+	callId: string
+	sessionId: string
+	from: string
+	to: string
+	seq: number
+	timestamp: number
+	payload: string
+}
+
+export const VOICE_MAX_FRAME_B64 = 12_000
+export const VOICE_FRAME_TIMESTAMP_SKEW_SEC = 30
+export const VOICE_CALL_MAX_DURATION_MS = 15 * 60 * 1000
 
 /** Inbound decrypted line (still to be checkSign'd / parsed by the host). */
 export interface InboundEnvelope {
@@ -137,6 +173,7 @@ export interface ChatEventMap {
 	status: StatusEvent
 	log: ChatLogEvent
 	historyBuffer: HistoryBufferEvent
+	voiceFrame: Record<string, unknown>
 }
 
 export type ChatEventName = keyof ChatEventMap
@@ -223,6 +260,28 @@ export interface HistoryLoadOptions {
 	tailCount?: number
 	/** When true, skip network and only read the local IndexedDB mirror (instant open). */
 	localOnly?: boolean
+	/**
+	 * `all` replays every decrypted entry to `historyBuffer`.
+	 * `fresh` emits only entries that were not already in the local plaintext corpus.
+	 * Default `fresh` so a later sync does not re-deliver the corpus.
+	 */
+	emit?: 'all' | 'fresh'
+}
+
+/**
+ * Read the chat module's local decrypted history. Already-decrypted entries come
+ * from the worker corpus and are not fetched from IPFS again.
+ */
+export interface HistoryReadOptions {
+	/** Contact EOA. Omit to read every peer. */
+	peer?: string
+	/**
+	 * Full-text query over extracted message text (body, call status, file name).
+	 * Whitespace-separated terms are AND-matched, case-insensitive.
+	 */
+	query?: string
+	/** Keep the newest matches when set. */
+	limit?: number
 }
 
 export interface BeamioChatHistory {
@@ -234,6 +293,11 @@ export interface BeamioChatHistory {
 	load(options?: HistoryLoadOptions): Promise<void>
 	/** Append (persist) a new sent/received entry to encrypted history + local mirror. */
 	append(entry: Omit<HistoryEntry, 'seq'>): Promise<void>
+	/**
+	 * Global read of the decrypted corpus. UI must use this instead of fetching
+	 * fragments itself. A `query` runs full-text search over the whole local history.
+	 */
+	read(options?: HistoryReadOptions): Promise<HistoryEntry[]>
 	/** Subscribe to incremental buffer batches during restore/append. */
 	onBuffer(cb: (batch: HistoryBufferEvent) => void): Unsubscribe
 }
@@ -247,9 +311,25 @@ export interface BeamioChatClient {
 		routerArmoredPublicKey: string,
 		command: Record<string, unknown>,
 	): Promise<boolean>
+	postOwnMailboxCommand(command: Record<string, unknown>): Promise<boolean>
+	sendVoiceFrame(routerArmoredPublicKey: string, frame: Record<string, unknown>): Promise<boolean>
+	startVoiceListen(
+		sessionId: string,
+		pushWakeup?: {
+			callId: string
+			calleeEoa: string
+			expiresAt: number
+			timestamp: number
+			offerText?: string
+			recipientPgp?: string
+		},
+	): Promise<boolean>
+	stopVoiceListen(sessionId: string): Promise<boolean>
 	on<K extends ChatEventName>(event: K, cb: ChatEventListener<K>): Unsubscribe
 	/** Probe mailbox listen-pool presence for the given contacts. */
 	queryPresence(contacts: ChatRoute[]): Promise<Record<string, boolean>>
+	/** Trusted native-wake answer, or null when the mailbox lookup failed. */
+	queryNativeWake(contact: ChatRoute): Promise<boolean | null>
 	/** Update the set of contacts to listen for and probe. */
 	setRoutes(routes: ChatRoute[]): void
 	history: BeamioChatHistory

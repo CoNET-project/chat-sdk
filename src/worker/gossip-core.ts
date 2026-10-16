@@ -11,7 +11,7 @@
  *
  * Routing rules preserved (repo `conet-p2p-mailbox-routing-protocol`,
  * `beamio-conet-chat-protocol`, `src/docs/gitbook/l0/si-developer-guide.md`):
- * listen encrypted to mailbox B route key via entry C ≠ B with `listenKind:'chat'`;
+ * listen encrypted to mailbox B route key via entry C ≠ B with `mailbox_listen`;
  * business payload encrypted to recipient EOA user PGP via entry A ≠ B; ACK
  * encrypted to mailbox B route key. Each POST wraps inner armor to **that entry's**
  * route public key. Clients never set `X-CoNET-Hop-Sigs`.
@@ -38,17 +38,18 @@ import {
 	markGossipNodeBad,
 	markGossipNodeHealthy,
 	pickGossipEntryNodesForSend,
-	pickListenEntryNodes,
+	pickHealthyGossipNodes,
 	pickRouteNodesByArmoredKey,
 	postUrl,
 	postWithTimeout,
 } from '../nodes.js'
 import { base64ToUtf8, keccakUtf8, utf8ToBase64 } from '../crypto.js'
-import { buildPostBody, encryptRouteCommand, wrapArmorToEntryRoute, wrapArmorToMailboxWork } from '../envelope.js'
+import { armorToString, buildPostBody, encryptOpaqueVoiceCommand, encryptRouteCommand, wrapArmorToEntryRoute, wrapArmorToMailboxWork } from '../envelope.js'
 
 /** Callbacks the worker entry wires to `postMessage`. */
 export interface GossipEmit {
 	message(line: string, armorHash: string | undefined, plain: boolean, viaDomain?: string): void
+	voiceFrame(payload: Record<string, unknown>): void
 	status(status: StatusEvent['status'], detail?: string): void
 	log(level: 'info' | 'warn' | 'error', message: string): void
 	presence(payload: PresenceEvent): void
@@ -84,8 +85,70 @@ function extractGossipListingBlockHeight(payload: unknown): string | null {
 function isGossipListingLivenessFrame(payload: unknown): boolean {
 	if (!payload || typeof payload !== 'object') return false
 	const row = payload as Record<string, unknown>
-	if (typeof row.ipaddress === 'string' || 'nodeWallets' in row) return true
-	return row.status != null && row.epoch != null
+	return typeof row.ipaddress === 'string' || 'nodeWallets' in row
+}
+
+const INBOUND_WRAPPER_KEYS = ['data', 'message', 'payload', 'body', 'text'] as const
+
+function findInboundArmor(value: unknown, depth = 0): string {
+	if (depth > 5) return ''
+	if (typeof value === 'string') {
+		const text = value.trim()
+		if (/^-----BEGIN PGP MESSAGE-----/i.test(text)) return text
+		if (text.startsWith('{') || text.startsWith('[')) {
+			try {
+				return findInboundArmor(JSON.parse(text), depth + 1)
+			} catch {
+				return ''
+			}
+		}
+		// A few mailbox relays wrap the armor in base64 before placing it in
+		// their JSON envelope. Decode only bounded, plausible base64 strings;
+		// never treat arbitrary text as a candidate.
+		if (text.length >= 32 && /^[A-Za-z0-9+/=_-]+$/.test(text)) {
+			try {
+				const normalized = text.replace(/-/g, '+').replace(/_/g, '/')
+				const decoded = base64ToUtf8(normalized).trim()
+				if (decoded && decoded !== text) {
+					return findInboundArmor(decoded, depth + 1)
+				}
+			} catch {
+				/* not base64 */
+			}
+		}
+	}
+	if (!value || typeof value !== 'object') return ''
+	const row = value as Record<string, unknown>
+	for (const key of INBOUND_WRAPPER_KEYS) {
+		const found = findInboundArmor(row[key], depth + 1)
+		if (found) return found
+	}
+	return ''
+}
+
+function parseInboundJson(value: string): unknown {
+	let current: unknown = value
+	for (let depth = 0; depth <= 5; depth += 1) {
+		if (typeof current !== 'string') return current
+		const text = current.trim()
+		try {
+			const parsed = JSON.parse(text) as unknown
+			if (parsed && typeof parsed === 'object') return parsed
+		} catch {
+			/* try base64 below */
+		}
+		try {
+			const decoded = base64ToUtf8(text).trim()
+			if (decoded && decoded !== text) {
+				current = decoded
+				continue
+			}
+		} catch {
+			/* not base64 */
+		}
+		return current
+	}
+	return current
 }
 
 export class GossipCore {
@@ -96,10 +159,9 @@ export class GossipCore {
 	private pgpPrivateKey: PrivateKey | null = null
 	private userPgpKeyID = ''
 	private listenController: AbortController | null = null
+	private voiceListenController: AbortController | null = null
 	private lastActivityAt = 0
 	private paused = false
-	/** Listen `Securitykey` (aes-256-cbc). Sent on the command; live SI SSE frames are still plaintext JSON. */
-	private listenSecurityKey = ''
 	private ackContext: {
 		routerArmoredPublicKey: string
 		entryNodes: NodeInfo[]
@@ -112,14 +174,20 @@ export class GossipCore {
 		this.cfg = payload
 		this.nodes = payload.nodes || []
 		this.routes = payload.routes || []
+		this.emit.log(
+			'info',
+			`chat worker init pgpArmor=${payload.identity.pgpPrivateKeyArmored.length} passphrase=${payload.identity.pgpPassphrase ? 'set' : 'empty'}`,
+		)
 		const pkHex = payload.identity.privateKeyHex.startsWith('0x')
 			? payload.identity.privateKeyHex
 			: `0x${payload.identity.privateKeyHex}`
 		this.wallet = new ethers.Wallet(pkHex)
 		const pk = await readPrivateKey({ armoredKey: payload.identity.pgpPrivateKeyArmored })
+		this.emit.log('info', `chat worker pgp key decrypted=${pk.isDecrypted()}`)
 		this.pgpPrivateKey = pk.isDecrypted()
 			? pk
 			: await decryptKey({ privateKey: pk, passphrase: payload.identity.pgpPassphrase || '' })
+		this.emit.log('info', 'chat worker pgp decrypt ready')
 		if (payload.identity.pgpPublicKeyArmored) {
 			try {
 				const keyObj = await readKey({ armoredKey: payload.identity.pgpPublicKeyArmored })
@@ -142,8 +210,8 @@ export class GossipCore {
 
 	pause(): void {
 		this.paused = true
-		this.listenSecurityKey = ''
 		this.clearListen('background_pause')
+		this.voiceListenController?.abort('voice_stop')
 		this.lastActivityAt = 0
 		this.emit.status('paused')
 	}
@@ -156,6 +224,7 @@ export class GossipCore {
 
 	destroy(): void {
 		this.clearListen('destroy')
+		this.voiceListenController?.abort('voice_stop')
 		this.wallet = null
 		this.pgpPrivateKey = null
 		this.cfg = null
@@ -172,7 +241,7 @@ export class GossipCore {
 		}
 	}
 
-	// ---- Listen (mailbox B route key, entry C ≠ B, listenKind:'chat') -----------
+	// ---- Listen (dedicated Mailbox B route, entry C ≠ B) -------------------------
 	private async startListen(): Promise<void> {
 		if (this.paused) return
 		if (!this.cfg || !this.wallet || !this.pgpPrivateKey) return
@@ -184,15 +253,13 @@ export class GossipCore {
 
 		// Resolve mailbox B route from the identity's own route (host injects own route key).
 		const ownRouteKey = this.cfg.identity.ownRouteArmoredPublicKey || ''
-		if (!ownRouteKey) {
-			this.emit.log('warn', 'listen: empty mailbox route key; awaiting identity')
-			this.emit.status('reconnecting', 'awaiting_route_key')
+		const routeNodes = pickRouteNodesByArmoredKey(this.nodes, ownRouteKey)
+		if (!ownRouteKey || !routeNodes.length) {
+			// Ask host to refresh nodes; retry shortly.
+			this.emit.log('warn', 'listen: no route node for own mailbox key; awaiting nodes')
+			this.emit.status('reconnecting', 'awaiting_route_nodes')
 			setTimeout(() => void this.startListen(), 6_000)
 			return
-		}
-		const routeNodes = pickRouteNodesByArmoredKey(this.nodes, ownRouteKey)
-		if (!routeNodes.length) {
-			this.emit.log('warn', 'listen: mailbox B not in Guardian list; posting via any entry')
 		}
 		const mailboxDomains = new Set(routeNodes.map((n) => n.domain))
 
@@ -202,23 +269,24 @@ export class GossipCore {
 		const rootSignal = controller.signal
 
 		try {
-			const key = utf8ToBase64(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))))
-			this.listenSecurityKey = key
+			const instanceId =
+				typeof crypto.randomUUID === 'function'
+					? crypto.randomUUID()
+					: utf8ToBase64(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))))
 			const innerArmor = await encryptRouteCommand(
 				this.wallet,
 				{
-					command: 'mining',
-					listenKind: 'chat',
+					command: 'mailbox_listen',
 					walletAddress: this.wallet.address,
-					algorithm: 'aes-256-cbc',
-					Securitykey: key,
+					instanceId,
 				},
 				ownRouteKey,
 			)
 
-			const listenEntries = pickListenEntryNodes(this.nodes, mailboxDomains)
-			if (!listenEntries.length) {
-				this.emit.log('warn', 'listen: empty node pool; retry')
+			const entryCandidates = this.nodes.filter((n) => !mailboxDomains.has(n.domain))
+			const healthyNodes = await pickHealthyGossipNodes(entryCandidates.length ? entryCandidates : this.nodes)
+			if (!healthyNodes.length) {
+				this.emit.log('warn', 'listen: no healthy entry C; retry')
 				this.emit.status('reconnecting', 'no_entry_c')
 				this.clearListen('connect_failed')
 				setTimeout(() => void this.startListen(), 6_000)
@@ -226,12 +294,11 @@ export class GossipCore {
 			}
 			this.ackContext = {
 				routerArmoredPublicKey: ownRouteKey,
-				entryNodes: listenEntries,
+				entryNodes: healthyNodes,
 				mailboxDomains: [...mailboxDomains],
 			}
 
-			this.emit.log('info', `listen starting via POST /post entries=${listenEntries.length}`)
-			this.spawnGossip(listenEntries, innerArmor, rootSignal)
+			this.spawnGossip(healthyNodes, innerArmor, rootSignal)
 		} catch (ex) {
 			this.emit.log('error', `startListen error: ${(ex as Error)?.message ?? String(ex)}`)
 			this.clearListen('connect_failed')
@@ -252,7 +319,9 @@ export class GossipCore {
 		const node = getRandomNode(nodes)!
 		const config: TimeoutConfig = {
 			connectTimeout: 12_000,
-			idleTimeout: 90_000,
+			// Mailbox B keepalives are bounded at 60–180s. Keep enough margin
+			// for transport/proxy jitter before declaring the SSE idle.
+			idleTimeout: 240_000,
 			readOperationTimeout: 20_000,
 			retryDelay: 2_000,
 			...timeoutConfig,
@@ -316,7 +385,6 @@ export class GossipCore {
 				this.lastActivityAt = Date.now()
 				reconnectAttempt = 0
 				this.emit.status('listening')
-				this.emit.log('info', `listen SSE open entry=${node.domain}`)
 				reader = res.body.getReader()
 				const decoder = new TextDecoder('utf-8')
 				let buffer = ''
@@ -406,36 +474,61 @@ export class GossipCore {
 		return 'unknown'
 	}
 
-	private async handleInbound(rawData: string, viaDomain: string, rootSignal: AbortSignal): Promise<void> {
-		if (rootSignal.aborted) return
-		let data: Record<string, unknown>
+	private async handleInbound(rawData: string, viaDomain: string, _rootSignal: AbortSignal): Promise<void> {
+		const trimmedRaw = rawData.trim()
+		let data: Record<string, unknown> | null = null
 		try {
-			data = JSON.parse(rawData)
+			const parsed = JSON.parse(trimmedRaw) as unknown
+			if (parsed && typeof parsed === 'object') {
+				data = parsed as Record<string, unknown>
+			}
 		} catch {
-			return
+			// Some mailbox/entry implementations deliver the SSE `data:` value
+			// as the armored PGP message itself. Keep that compatibility path;
+			// do not require JSON before attempting decryption.
 		}
-		if (isGossipListingLivenessFrame(data) && extractGossipListingBlockHeight(data)) {
+		if (data && isGossipListingLivenessFrame(data) && extractGossipListingBlockHeight(data)) {
 			// Liveness/listing frame: no business payload, but proves the SSE is alive.
 			// Refresh internal activity + surface a heartbeat so the host can keep its
 			// own foreground/background staleness timer fresh (parity with the old
 			// main-thread noteGossipActivity() that fired on every frame).
 			this.lastActivityAt = Date.now()
-			const height = extractGossipListingBlockHeight(data)
 			this.emit.status('listening', 'heartbeat')
-			this.emit.log('info', height ? `heartbeat epoch=${height}` : 'heartbeat')
+			return
+		}
+		if (data?.type === 'mailbox_keepalive') {
+			this.lastActivityAt = Date.now()
+			this.emit.status('listening', 'heartbeat')
 			return
 		}
 		try {
-			const armored = typeof data.data === 'string' ? data.data : ''
+			if (data?.type === 'voice_frame_v1') {
+				this.emit.voiceFrame(data)
+				return
+			}
+			// Mailbox relays can add several JSON envelopes. Walk only a bounded
+			// set of wrapper keys; never log or forward the plaintext/ciphertext.
+			const armored = findInboundArmor(data ?? trimmedRaw)
 			if (armored && /^-----BEGIN PGP MESSAGE-----/i.test(armored)) {
+				this.emit.log('info', `inbound PGP candidate bytes=${armored.length} via=${viaDomain}`)
 				const msg = await readMessage({ armoredMessage: armored })
 				const { data: decrypted } = await decrypt({ message: msg, decryptionKeys: this.pgpPrivateKey! })
 				const decryptedString = typeof decrypted === 'string' ? decrypted : String(decrypted)
-				const kkk = base64ToUtf8(decryptedString)
+				// Senders historically used both base64(JSON) and JSON directly.
+				// Normalize both, including bounded nested data/message wrappers.
+				const parsed = parseInboundJson(decryptedString)
+				const kkk =
+					typeof parsed === 'string'
+						? parsed
+						: JSON.stringify(parsed)
+				this.emit.log(
+					'info',
+					`inbound PGP decrypted chars=${kkk.length} json=${kkk.trim().startsWith('{')}`,
+				)
 				const armorHash = keccakUtf8(armored)
 				let line = kkk
 				try {
-					const env = JSON.parse(kkk)
+					const env = JSON.parse(kkk) as Record<string, unknown>
 					if (env && typeof env === 'object') {
 						env._beamioPgpArmorHash = armorHash
 						line = JSON.stringify(env)
@@ -444,7 +537,7 @@ export class GossipCore {
 					/* keep raw */
 				}
 				this.emit.message(line, armorHash, false, viaDomain)
-			} else if (data.from && data.text != null && data.signMessage) {
+			} else if (data && data.from && data.text != null && data.signMessage) {
 				this.emit.message(JSON.stringify(data), undefined, true, viaDomain)
 			}
 		} catch (ex: unknown) {
@@ -561,6 +654,23 @@ export class GossipCore {
 		return out
 	}
 
+	/**
+	 * After presence: whether the contact mailbox has a registered native shell
+	 * (iOS, Android, Windows, Linux, or macOS) that push can wake.
+	 * null = untrusted; do not clear the last trusted answer.
+	 */
+	async queryNativeWake(contact: ChatRoute): Promise<boolean | null> {
+		if (!this.wallet) return null
+		const addr = (contact.address || '').trim()
+		const route = (contact.routerArmoredPublicKey || '').trim()
+		if (!addr || !ethers.isAddress(addr) || !route) return null
+		const routeNodes = pickRouteNodesByArmoredKey(this.nodes, route)
+		const mailboxDomains = new Set(routeNodes.map((n) => n.domain).filter(Boolean))
+		const r = await this.walletNativeWakeQuery(addr, route, mailboxDomains)
+		if (!r?.ok) return null
+		return r.nativeWakeable
+	}
+
 	private async walletOnlineQuery(
 		targetWallet: string,
 		routerArmoredPublicKey: string,
@@ -577,8 +687,10 @@ export class GossipCore {
 			}
 			const innerArmor = await encryptRouteCommand(this.wallet, command, routerArmoredPublicKey)
 			const pool = this.nodes.filter((n) => n?.domain && !mailboxDomains.has(n.domain))
-			const entries = await pickGossipEntryNodesForSend(pool.length ? pool : this.nodes, 4, mailboxDomains)
-			const targets = entries.length ? entries : getRandomNodes(pool.length ? pool : this.nodes, 4)
+			if (!pool.length) return null
+			const entries = await pickGossipEntryNodesForSend(pool, 4, mailboxDomains)
+			const targets = entries.length ? entries : getRandomNodes(pool, Math.min(4, pool.length))
+			if (!targets.length) return null
 			const results = await Promise.all(
 				targets.map(async (node) => {
 					const url = postUrl(node.domain)
@@ -621,6 +733,68 @@ export class GossipCore {
 		}
 	}
 
+	private async walletNativeWakeQuery(
+		targetWallet: string,
+		routerArmoredPublicKey: string,
+		mailboxDomains: Set<string>,
+	): Promise<{ ok: boolean; nativeWakeable: boolean } | null> {
+		if (!this.wallet) return null
+		try {
+			const timestamp = Math.floor(Date.now() / 1000)
+			const command = {
+				command: 'wallet_native_wake_query',
+				walletAddress: this.wallet.address,
+				targetWallet: ethers.getAddress(targetWallet),
+				timestamp,
+			}
+			const innerArmor = await encryptRouteCommand(this.wallet, command, routerArmoredPublicKey)
+			const pool = this.nodes.filter((n) => n?.domain && !mailboxDomains.has(n.domain))
+			if (!pool.length) return null
+			const entries = await pickGossipEntryNodesForSend(pool, 4, mailboxDomains)
+			const targets = entries.length ? entries : getRandomNodes(pool, Math.min(4, pool.length))
+			if (!targets.length) return null
+			const results = await Promise.all(
+				targets.map(async (node) => {
+					const url = postUrl(node.domain)
+					try {
+						const armored =
+							this.cfg?.runtime.outerWrap === false
+								? innerArmor
+								: await wrapArmorToEntryRoute(innerArmor, node.armoredPublicKey)
+						const res = await postWithTimeout(
+							url,
+							{
+								method: 'POST',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify(buildPostBody(armored)),
+								referrerPolicy: 'no-referrer',
+							},
+							10_000,
+						)
+						const text = (await res.text()).trim()
+						if (!text) return null
+						try {
+							return JSON.parse(text)
+						} catch {
+							const m = text.match(/\{[\s\S]*\}/)
+							return m ? JSON.parse(m[0]) : null
+						}
+					} catch {
+						return null
+					}
+				}),
+			)
+			for (const r of results) {
+				if (r && typeof r === 'object' && (r as { ok?: boolean }).ok === true) {
+					return { ok: true, nativeWakeable: !!(r as { nativeWakeable?: boolean }).nativeWakeable }
+				}
+			}
+			return null
+		} catch {
+			return null
+		}
+	}
+
 	/** Encrypt a mailbox command (e.g. gossip_delivery_ack) to route B and POST via entry C ≠ B. */
 	async postMailboxCommand(
 		routerArmoredPublicKey: string,
@@ -637,5 +811,143 @@ export class GossipCore {
 			this.emit.log('warn', `postMailboxCommand error: ${(ex as Error)?.message ?? String(ex)}`)
 			return false
 		}
+	}
+
+	async postOwnMailboxCommand(command: Record<string, unknown>): Promise<boolean> {
+		const route = this.cfg?.identity.ownRouteArmoredPublicKey || ''
+		if (!route) return false
+		return this.postMailboxCommand(route, command)
+	}
+
+	async sendVoiceFrame(routerArmoredPublicKey: string, frame: Record<string, unknown>): Promise<boolean> {
+		const command = { command: 'voice_uplink', ...frame, timestamp: Math.floor(Date.now() / 1000) }
+		const innerArmor = await encryptOpaqueVoiceCommand(command, routerArmoredPublicKey)
+		const mailboxDomains = new Set(
+			pickRouteNodesByArmoredKey(this.nodes, routerArmoredPublicKey).map((n) => n.domain),
+		)
+		return this.postToEntries(innerArmor, mailboxDomains)
+	}
+
+	async startVoiceListen(
+		sessionId: string,
+		pushWakeup?: {
+			callId: string
+			calleeEoa: string
+			expiresAt: number
+			timestamp: number
+			offerText?: string
+			recipientPgp?: string
+		},
+	): Promise<boolean> {
+		const wallet = this.wallet
+		if (this.paused || !this.cfg || !wallet || !sessionId) {
+			this.emit.log('warn', `voice listen refused early: paused=${this.paused} cfg=${!!this.cfg} wallet=${!!wallet} session=${!!sessionId}`)
+			return false
+		}
+		this.voiceListenController?.abort('voice_replace')
+		const route = this.cfg.identity.ownRouteArmoredPublicKey || ''
+		const routeNodes = pickRouteNodesByArmoredKey(this.nodes, route)
+		const mailboxDomains = new Set(routeNodes.map((n) => n.domain))
+		const pool = this.nodes.filter((n) => !mailboxDomains.has(n.domain))
+		const candidates = pool.length ? pool : this.nodes
+		const healthy = await pickHealthyGossipNodes(candidates)
+		const entries = healthy.length ? healthy : candidates
+		if (!route || !entries.length) {
+			this.emit.log('warn', `voice listen refused: route=${!!route} nodes=${this.nodes.length} entries=${entries.length}`)
+			return false
+		}
+		let offerArmor = ''
+		const offerText = pushWakeup?.offerText?.trim() || ''
+		const recipientPgp = pushWakeup?.recipientPgp?.trim() || ''
+		if (offerText && recipientPgp) {
+			try {
+				const signMessage = await wallet.signMessage(offerText)
+				const envelope = {
+					timestamp: Date.now(),
+					text: offerText,
+					from: wallet.address,
+					signMessage,
+				}
+				offerArmor = armorToString(await encrypt({
+					message: await createMessage({ text: utf8ToBase64(JSON.stringify(envelope)) }),
+					encryptionKeys: await readKey({ armoredKey: recipientPgp }),
+					config: { preferredCompressionAlgorithm: enums.compression.zlib },
+				}))
+			} catch (ex) {
+				this.emit.log('warn', `voice offer encrypt failed: ${(ex as Error)?.message ?? String(ex)}`)
+				return false
+			}
+			if (!offerArmor.includes('-----BEGIN PGP MESSAGE-----') || offerArmor.length > 48_000) {
+				this.emit.log('warn', 'voice offer armor missing or too large')
+				return false
+			}
+		}
+		const inner = await encryptOpaqueVoiceCommand({
+			command: 'voice_listen',
+			sessionId,
+			timestamp: Math.floor(Date.now() / 1000),
+			...(pushWakeup ? {
+				callId: pushWakeup.callId,
+				targetWallet: pushWakeup.calleeEoa,
+				expiresAt: pushWakeup.expiresAt,
+				pushTimestamp: pushWakeup.timestamp,
+			} : {}),
+			...(offerArmor ? { offerArmor } : {}),
+		}, route)
+		const controller = new AbortController()
+		this.voiceListenController = controller
+		const node = getRandomNode(entries)!
+		void (async () => {
+			try {
+				const armored = this.cfg?.runtime.outerWrap === false ? inner : await wrapArmorToEntryRoute(inner, node.armoredPublicKey)
+				const res = await fetch(postUrl(node.domain), {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', Connection: 'keep-alive' },
+					body: JSON.stringify(buildPostBody(armored)),
+					signal: controller.signal,
+					cache: 'no-store',
+				})
+				if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+				const reader = res.body.getReader()
+				const decoder = new TextDecoder()
+				let buffer = ''
+				while (!controller.signal.aborted) {
+					const { value, done } = await reader.read()
+					if (done) break
+					buffer += decoder.decode(value, { stream: true })
+					let idx: number
+					while ((idx = buffer.indexOf('\n\n')) >= 0) {
+						const block = buffer.slice(0, idx)
+						buffer = buffer.slice(idx + 2)
+						const payload = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n').trim()
+						if (!payload) continue
+						try {
+							const frame = JSON.parse(payload) as Record<string, unknown>
+							if (frame.type === 'voice_frame_v1') this.emit.voiceFrame(frame)
+						} catch { /* malformed frame */ }
+					}
+				}
+				await reader.cancel()
+			} catch (ex) {
+				if (!controller.signal.aborted) this.emit.log('warn', `voice SSE failed: ${(ex as Error)?.message ?? String(ex)}`)
+			}
+		})()
+		return true
+	}
+
+	async stopVoiceListen(sessionId: string): Promise<boolean> {
+		const route = this.cfg?.identity.ownRouteArmoredPublicKey || ''
+		const wallet = this.wallet
+		this.voiceListenController?.abort('voice_stop')
+		this.voiceListenController = null
+		if (!route || !wallet) return true
+		const innerArmor = await encryptOpaqueVoiceCommand({
+			command: 'voice_unlisten',
+			sessionId,
+			timestamp: Math.floor(Date.now() / 1000),
+		}, route)
+		return this.postToEntries(innerArmor, new Set(
+			pickRouteNodesByArmoredKey(this.nodes, route).map((n) => n.domain),
+		))
 	}
 }

@@ -12,6 +12,7 @@ import type {
 	HistoryBufferEvent,
 	HistoryEntry,
 	HistoryLoadOptions,
+	HistoryReadOptions,
 	InboundEnvelope,
 	NodeInfo,
 	PresenceEvent,
@@ -44,7 +45,9 @@ export type WorkerCommand =
 	| { type: 'setNodes'; nodes: NodeInfo[] }
 	| { type: 'send'; reqId: number; to: ChatRoute; payload: string; sendId: string; beamioNoPush?: boolean }
 	| { type: 'queryPresence'; reqId: number; contacts: ChatRoute[] }
+	| { type: 'queryNativeWake'; reqId: number; contact: ChatRoute }
 	| { type: 'historyLoad'; reqId: number; options?: HistoryLoadOptions }
+	| { type: 'historyRead'; reqId: number; options?: HistoryReadOptions }
 	| { type: 'historyAppend'; reqId: number; entry: Omit<HistoryEntry, 'seq'> }
 	/** Encrypt an arbitrary mailbox command (e.g. gossip_delivery_ack) to route B and POST via entry C ≠ B. */
 	| {
@@ -53,6 +56,32 @@ export type WorkerCommand =
 			routerArmoredPublicKey: string
 			command: Record<string, unknown>
 	  }
+	| {
+			type: 'ownMailboxCommand'
+			reqId: number
+			command: Record<string, unknown>
+	  }
+	| {
+			type: 'voiceFrame'
+			reqId: number
+			routerArmoredPublicKey: string
+			frame: Record<string, unknown>
+	  }
+	| {
+			type: 'voiceListen'
+			reqId: number
+			sessionId: string
+			pushWakeup?: {
+				callId: string
+				calleeEoa: string
+				expiresAt: number
+				timestamp: number
+				/** Signed offer JSON. The worker encrypts it to the callee user PGP. */
+				offerText?: string
+				recipientPgp?: string
+			}
+	  }
+	| { type: 'voiceUnlisten'; reqId: number; sessionId: string }
 	| { type: 'pause' }
 	| { type: 'resume' }
 	| { type: 'destroy' }
@@ -67,6 +96,7 @@ export type WorkerOutbound =
 	| { type: 'event:presence'; payload: PresenceEvent }
 	| { type: 'event:status'; payload: StatusEvent }
 	| { type: 'event:historyBuffer'; payload: HistoryBufferEvent }
+	| { type: 'event:voiceFrame'; payload: Record<string, unknown> }
 	| { type: 'event:log'; level: 'info' | 'warn' | 'error'; message: string }
 	/** Worker asks host (main thread) to refresh node list (host owns discovery). */
 	| { type: 'nodesRequest'; reqId: number }

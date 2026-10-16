@@ -63,36 +63,16 @@ async function postWithTimeout(url: string, init: RequestInit, timeoutMs = 12_00
 export { postWithTimeout }
 
 const probeGossipNode = async (node: NodeInfo, timeoutMs = 4_000): Promise<boolean> => {
-	const origin = (globalThis as { location?: { origin?: string } }).location?.origin || 'https://beamio.app'
-	const url = postUrl(node.domain)
-	try {
-		const res = await postWithTimeout(
-			url,
-			{
-				method: 'OPTIONS',
-				headers: {
-					Origin: origin,
-					'Access-Control-Request-Method': 'POST',
-					'Access-Control-Request-Headers': 'content-type',
-				},
-			},
-			timeoutMs,
-		)
-		const acao = (res.headers.get('access-control-allow-origin') || '').trim()
-		if (res.status > 0 && res.status < 500 && (acao === '*' || acao.length > 0)) {
-			markGossipNodeHealthy(node.domain)
-			return true
-		}
-	} catch {
-		/* fall through to GET / */
-	}
+	// GET / only — never OPTIONS /post. Init samples up to 10 entries; SI 404 on a
+	// partial first record used to paint Chrome red even when the node was fine.
+	// Listen POST still does the real CORS preflight.
 	try {
 		const res = await postWithTimeout(
 			`https://${node.domain}.conet.network/`,
 			{ method: 'GET', headers: { Accept: 'text/html' } },
 			timeoutMs,
 		)
-		if (res.status > 0 && res.status < 500) {
+		if (res.status >= 200 && res.status < 400) {
 			markGossipNodeHealthy(node.domain)
 			return true
 		}
@@ -101,12 +81,6 @@ const probeGossipNode = async (node: NodeInfo, timeoutMs = 4_000): Promise<boole
 	}
 	markGossipNodeBad(node.domain)
 	return false
-}
-
-/** Entry C pool for listen. Never require GET / health — that homepage has no CORS. */
-export function pickListenEntryNodes(pool: NodeInfo[], excludeDomains?: Set<string>): NodeInfo[] {
-	const filtered = excludeDomains?.size ? pool.filter((n) => !excludeDomains.has(n.domain)) : pool
-	return filtered.length ? filtered : pool
 }
 
 export const pickHealthyGossipNodes = async (nodes: NodeInfo[]): Promise<NodeInfo[]> => {

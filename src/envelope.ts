@@ -141,3 +141,21 @@ export async function encryptRouteCommand(
 		}),
 	)
 }
+
+/** Encrypt a voice route command without embedding a recoverable EOA signature. */
+export async function encryptOpaqueVoiceCommand(
+	command: Record<string, unknown>,
+	routePublicKeyArmored: string,
+): Promise<string> {
+	const encryptionKeys = await readKey({ armoredKey: routePublicKeyArmored })
+	const pgpMsg = await createMessage({
+		text: utf8ToBase64(JSON.stringify(command)),
+	})
+	return armorToString(
+		await encrypt({
+			message: pgpMsg,
+			encryptionKeys,
+			config: { preferredCompressionAlgorithm: enums.compression.zlib },
+		}),
+	)
+}

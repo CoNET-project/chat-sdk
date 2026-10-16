@@ -24,11 +24,39 @@ function post(msg: WorkerOutbound): void {
 
 let gossip: GossipCore | null = null
 let history: HistoryStore | null = null
+let historySyncTimer: ReturnType<typeof setTimeout> | null = null
+
+const HISTORY_SYNC_DELAY_MS = 30_000
+
+function stopHistorySync(): void {
+	if (historySyncTimer !== null) {
+		clearTimeout(historySyncTimer)
+		historySyncTimer = null
+	}
+}
+
+function scheduleHistorySync(): void {
+	stopHistorySync()
+	historySyncTimer = setTimeout(async () => {
+		historySyncTimer = null
+		if (!history) return
+		try {
+			const changed = await history.syncFromHead()
+			// Publish only bodies that were not already in the plaintext corpus.
+			if (changed) await history.load({ localOnly: true, emit: 'fresh' })
+		} catch (ex) {
+			post({ type: 'event:log', level: 'warn', message: `history sync failed: ${(ex as Error)?.message ?? String(ex)}` })
+		} finally {
+			if (history) scheduleHistorySync()
+		}
+	}, HISTORY_SYNC_DELAY_MS)
+}
 
 function makeGossip(): GossipCore {
 	return new GossipCore({
 		message: (line, armorHash, plain, viaDomain) =>
 			post({ type: 'event:message', payload: { line, armorHash, plain, viaDomain, receivedAt: Date.now() } }),
+		voiceFrame: (payload) => post({ type: 'event:voiceFrame', payload }),
 		status: (status: StatusEvent['status'], detail?: string) =>
 			post({ type: 'event:status', payload: { status, detail } }),
 		log: (level, message) => post({ type: 'event:log', level, message }),
@@ -120,6 +148,7 @@ async function handle(cmd: WorkerInbound): Promise<void> {
 				history = makeHistory(cmd.payload)
 				await gossip.init(cmd.payload)
 				post({ type: 'ready', reqId: cmd.reqId })
+				scheduleHistorySync()
 			} catch (ex) {
 				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
 			}
@@ -149,10 +178,28 @@ async function handle(cmd: WorkerInbound): Promise<void> {
 			}
 			return
 		}
+		case 'queryNativeWake': {
+			try {
+				const result = await gossip!.queryNativeWake(cmd.contact)
+				post({ type: 'ack', reqId: cmd.reqId, ok: true, result })
+			} catch (ex) {
+				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
+			}
+			return
+		}
 		case 'historyLoad': {
 			try {
 				await history!.load(cmd.options)
 				post({ type: 'ack', reqId: cmd.reqId, ok: true })
+			} catch (ex) {
+				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
+			}
+			return
+		}
+		case 'historyRead': {
+			try {
+				const entries = await history!.read(cmd.options)
+				post({ type: 'ack', reqId: cmd.reqId, ok: true, result: entries })
 			} catch (ex) {
 				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
 			}
@@ -176,6 +223,42 @@ async function handle(cmd: WorkerInbound): Promise<void> {
 			}
 			return
 		}
+		case 'ownMailboxCommand': {
+			try {
+				const ok = await gossip!.postOwnMailboxCommand(cmd.command)
+				post({ type: 'ack', reqId: cmd.reqId, ok: true, result: { sent: ok } })
+			} catch (ex) {
+				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
+			}
+			return
+		}
+		case 'voiceFrame': {
+			try {
+				const ok = await gossip!.sendVoiceFrame(cmd.routerArmoredPublicKey, cmd.frame)
+				post({ type: 'ack', reqId: cmd.reqId, ok: true, result: { sent: ok } })
+			} catch (ex) {
+				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
+			}
+			return
+		}
+		case 'voiceListen': {
+			try {
+				const ok = await gossip!.startVoiceListen(cmd.sessionId, cmd.pushWakeup)
+				post({ type: 'ack', reqId: cmd.reqId, ok: true, result: { started: ok } })
+			} catch (ex) {
+				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
+			}
+			return
+		}
+		case 'voiceUnlisten': {
+			try {
+				const ok = await gossip!.stopVoiceListen(cmd.sessionId)
+				post({ type: 'ack', reqId: cmd.reqId, ok: true, result: { stopped: ok } })
+			} catch (ex) {
+				post({ type: 'ack', reqId: cmd.reqId, ok: false, error: (ex as Error)?.message ?? String(ex) })
+			}
+			return
+		}
 		case 'pause':
 			gossip?.pause()
 			return
@@ -183,6 +266,7 @@ async function handle(cmd: WorkerInbound): Promise<void> {
 			gossip?.resume()
 			return
 		case 'destroy':
+			stopHistorySync()
 			gossip?.destroy()
 			history?.destroy()
 			gossip = null

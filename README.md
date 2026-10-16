@@ -24,7 +24,7 @@ Beamio CoNET Chat SDK — **runs the gossip transport entirely inside a Web Work
 │   • init() → getNodes() → postMessage(init)                               │
 │   • sendMessage / queryPresence / setRoutes / setNodes                    │
 │   • on('message'|'delivery'|'presence'|'status'|'log'|historyBuffer)      │
-│   • history.load / history.append / history.onBuffer                      │
+│   • history.load / history.read / history.append / history.onBuffer       │
 │   ▲ plaintext env.line → host's existing addNewMessage serial queue       │
 └──────────────┬───────────────────────────────▲───────────────────────────┘
         postMessage(Command)                  postMessage(Event/Receipt)
@@ -176,11 +176,16 @@ client.setRoutes(myContactRoutes)
 
 | Method | Description |
 |---|---|
-| `load(options?)` | restore encrypted history: locate index (`point-${L}` / IndexedDB) → decrypt → decrypt the tail first → backfill in the background; emits `historyBuffer` incrementally |
-| `append(entry)` | write a newly received/sent entry to encrypted history + local mirror |
+| `load(options?)` | restore encrypted history: locate the chain head → decrypt missing fragments → emit `historyBuffer`. Default `emit: 'fresh'` publishes only fragments decrypted on this pass |
+| `read(options?)` | return the local decrypted corpus. Does not contact the chain or IPFS. Filter by `peer`, AND-match `query` tokens, optional `limit` (newest) |
+| `append(entry)` | write a newly received/sent entry to encrypted history and remember its plaintext in the local corpus |
 | `onBuffer(cb): Unsubscribe` | subscribe to incremental batches during restore/append |
 
-`HistoryLoadOptions`: `peer?` (single contact or all), `tailCount?` (default 60, i.e. "last 2 screens"), `localOnly?` (IndexedDB only, for instant display).
+`HistoryLoadOptions`: `peer?`, `tailCount?` (default 60), `localOnly?`, `emit?: 'all' | 'fresh'` (default `'fresh'`).
+
+`HistoryReadOptions`: `peer?` (EOA), `query?` (whitespace-separated tokens, all required, case-insensitive, matched against rendered message text), `limit?` (keep the newest matches).
+
+Host bridges should expose `read` as `readDecryptedChatHistory` and `searchDecryptedChatHistory(query)`. When the Worker is not ready, return `null` (an untrusted miss). Do not treat `null` or a thrown read as an empty history. Do not log the query string or message bodies.
 
 ---
 
@@ -212,35 +217,32 @@ fragment ratchet  k_i = HKDF(master, `frag|${seq}|${cid_{i-1}}`)   // cid_{-1}=H
 ```
 
 - Every `cid_{i-1}` is recorded in the index, so any `k_i` is O(1) to derive — enabling **newest-first** restore.
-- **IndexedDB local-first**: `localOnly` for instant display; network failures **do not overwrite** trusted local history (`beamio-trusted-vs-untrusted-fetch`).
-- **Server-side `point-` pointers**: content is still stored as `keccak(content)=hash1`, with an extra alias `point-${L}` → `hash1`. Requires EOA signature + owner binding + monotonic timestamp (blocks hijacking/replay). See `x402sdk/src/endpoint/fragmentClusterServer.ts`.
+- **IndexedDB local-first**: ciphertext fragments and the encrypted index stay local. Network failures **do not overwrite** trusted local history.
+- **Decrypted corpus**: after a fragment is decrypted, the Worker stores `{ entry, searchText }` in memory and in Worker IndexedDB under `beamio.chat.history.plain:{eoa}:{cid}`. Later reads hit memory, then that plaintext record, then the local ciphertext, and only then IPFS. A just-sent message is stored as plaintext at encrypt time, so the UI does not re-download it. An unchanged chain head hash skips the index download. UI code obtains history only through `history.read` (and `historyBuffer` for newly decrypted rows). Full-text search is `history.read({ query })` over the rendered text of the whole corpus.
+- **Cross-device recover** still uses RPC `getPointer` plus IPFS when a `cid` has no local plaintext. The chain stores only the index hash.
 
 ---
 
-## Integrating into SilentPassUI (vendored example)
+## Integrating into SilentPassUI
 
-Because sub-projects live in separate Git repos and `file:` deps are awkward on remote builds, SilentPassUI **vendors** the SDK source into `src/vendor/beamio-chat-sdk/`, bridged via `services/chatWorkerBridge.ts`:
+Consumer PWA depends on the published package. Do not keep a second source tree under `src/vendor/`.
 
 ```ts
-// services/chatWorkerBridge.ts (key points)
-import { createBeamioChatClient } from '../vendor/beamio-chat-sdk'
+import { createBeamioChatClient } from '@conet.project/chat-sdk'
 
 function makeGossipWorker(): Worker {
-  return new Worker(new URL('../vendor/beamio-chat-sdk/worker/entry.ts', import.meta.url), {
+  return new Worker(new URL('@conet.project/chat-sdk/worker', import.meta.url), {
     type: 'module',
     name: 'beamio-chat-gossip',
   })
 }
 
 const client = createBeamioChatClient(config, { workerFactory: makeGossipWorker })
-client.on('message', (env) => { if (env.line) onLine(env.line) })   // → App.tsx addNewMessage
-client.on('status', (st) => { if (st.status === 'listening') noteGossipActivity() })
-await client.init()
+const history = await client.history.read()
+const matches = await client.history.read({ query: 'invoice paid', peer: peerEoa })
 ```
 
-In `services/chat.ts`, `connectToGossipNode` only parses routes + healthy entries (for delivery ACK) on the main thread; the inbound LISTEN loop is fully delegated to the Worker. Decrypted plaintext lines flow through `onLine → newMessage → App.tsx addNewMessage` (unchanged serial queue).
-
-> Keep the vendored copy in sync with the source; changes to this SDK must be mirrored into `src/SilentPassUI/src/vendor/beamio-chat-sdk/`. Vendored relative imports strip `.js` suffixes to match CRA `moduleResolution:"node"`.
+The host bridge (`readDecryptedChatHistory` / `searchDecryptedChatHistory` / `onDecryptedChatHistory`) is the only UI entry. Pages do not fetch IPFS history themselves.
 
 ---
 
@@ -298,4 +300,4 @@ Package exports:
 
 ## License
 
-MIT (private release, `publishConfig.access = restricted`).
+MIT (`publishConfig.access = public`).

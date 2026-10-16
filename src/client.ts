@@ -19,6 +19,7 @@ import type {
 	HistoryBufferEvent,
 	HistoryEntry,
 	HistoryLoadOptions,
+	HistoryReadOptions,
 	NodeInfo,
 	Unsubscribe,
 } from './types.js'
@@ -56,6 +57,10 @@ class ChatHistoryBridge implements BeamioChatHistory {
 		return this.client.request<void>({ type: 'historyAppend', reqId: 0, entry })
 	}
 
+	read(options?: HistoryReadOptions): Promise<HistoryEntry[]> {
+		return this.client.request<HistoryEntry[]>({ type: 'historyRead', reqId: 0, options }, 60_000)
+	}
+
 	onBuffer(cb: (batch: HistoryBufferEvent) => void): Unsubscribe {
 		this.bufferListeners.add(cb)
 		return () => this.bufferListeners.delete(cb)
@@ -83,6 +88,7 @@ class BeamioChatClientImpl implements BeamioChatClient {
 		status: new Set(),
 		log: new Set(),
 		historyBuffer: new Set(),
+		voiceFrame: new Set(),
 	}
 	private historyBridge: ChatHistoryBridge
 	private routes: ChatRoute[] = []
@@ -155,6 +161,11 @@ class BeamioChatClientImpl implements BeamioChatClient {
 		return this.request<Record<string, boolean>>({ type: 'queryPresence', reqId: 0, contacts })
 	}
 
+	/** After presence: true/false when the mailbox lookup is trusted; null when it is not. */
+	async queryNativeWake(contact: ChatRoute): Promise<boolean | null> {
+		return this.request<boolean | null>({ type: 'queryNativeWake', reqId: 0, contact })
+	}
+
 	/** Encrypt & POST an arbitrary mailbox command (e.g. gossip_delivery_ack) to route B via entry C ≠ B. */
 	async postMailboxCommand(
 		routerArmoredPublicKey: string,
@@ -167,6 +178,46 @@ class BeamioChatClientImpl implements BeamioChatClient {
 			command,
 		})
 		return !!r?.sent
+	}
+
+	/** Encrypt and post a command to this wallet's own mailbox route. */
+	async postOwnMailboxCommand(command: Record<string, unknown>): Promise<boolean> {
+		const r = await this.request<{ sent: boolean }>({
+			type: 'ownMailboxCommand',
+			reqId: 0,
+			command,
+		})
+		return !!r?.sent
+	}
+
+	async sendVoiceFrame(routerArmoredPublicKey: string, frame: Record<string, unknown>): Promise<boolean> {
+		const r = await this.request<{ sent: boolean }>({
+			type: 'voiceFrame',
+			reqId: 0,
+			routerArmoredPublicKey,
+			frame,
+		})
+		return !!r?.sent
+	}
+
+	async startVoiceListen(
+		sessionId: string,
+		pushWakeup?: {
+			callId: string
+			calleeEoa: string
+			expiresAt: number
+			timestamp: number
+			offerText?: string
+			recipientPgp?: string
+		},
+	): Promise<boolean> {
+		const r = await this.request<{ started: boolean }>({ type: 'voiceListen', reqId: 0, sessionId, pushWakeup })
+		return !!r?.started
+	}
+
+	async stopVoiceListen(sessionId: string): Promise<boolean> {
+		const r = await this.request<{ stopped: boolean }>({ type: 'voiceUnlisten', reqId: 0, sessionId })
+		return !!r?.stopped
 	}
 
 	on<K extends ChatEventName>(event: K, cb: ChatEventListener<K>): Unsubscribe {
@@ -197,12 +248,26 @@ class BeamioChatClientImpl implements BeamioChatClient {
 	}
 
 	// ---- internals ------------------------------------------------------------
-	request<T>(cmd: WorkerInbound & { reqId: number }): Promise<T> {
+	request<T>(cmd: WorkerInbound & { reqId: number }, timeoutMs = 20_000): Promise<T> {
 		if (!this.worker) return Promise.reject(new Error('client not initialised'))
 		const reqId = this.reqSeq++
 		const message = { ...cmd, reqId } as WorkerInbound
 		return new Promise<T>((resolve, reject) => {
-			this.pending.set(reqId, { resolve: resolve as (v: unknown) => void, reject })
+			const timer = setTimeout(() => {
+				if (!this.pending.has(reqId)) return
+				this.pending.delete(reqId)
+				reject(new Error('Chat worker did not respond'))
+			}, timeoutMs)
+			this.pending.set(reqId, {
+				resolve: (value) => {
+					clearTimeout(timer)
+					resolve(value as T)
+				},
+				reject: (error) => {
+					clearTimeout(timer)
+					reject(error)
+				},
+			})
 			this.worker!.postMessage(message)
 		})
 	}
@@ -253,6 +318,9 @@ class BeamioChatClientImpl implements BeamioChatClient {
 			case 'event:historyBuffer':
 				this.emit('historyBuffer', msg.payload)
 				this.historyBridge._emit(msg.payload)
+				return
+			case 'event:voiceFrame':
+				this.emit('voiceFrame', msg.payload)
 				return
 			case 'event:log':
 				this.emit('log', { level: msg.level, message: msg.message })

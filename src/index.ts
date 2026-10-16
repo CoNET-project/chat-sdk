@@ -46,6 +46,7 @@ export type {
 	HistoryBufferEvent,
 	HistoryEntry,
 	HistoryLoadOptions,
+	HistoryReadOptions,
 	InboundEnvelope,
 	NodeInfo,
 	PersistenceAdapter,
